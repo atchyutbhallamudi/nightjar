@@ -1,4 +1,4 @@
-# Mech Royale bot image. Build from the repo root: docker build -t my-bot .
+# Bot image. Build from the repo root: docker build -t my-bot .
 # Matches run it with no network, a read-only disk (only /tmp is writable), 1 CPU, 512 MB,
 # as user 65534, with the map mounted read-only at /arena. The bot uses only the standard library.
 FROM python:3.13.18-slim
