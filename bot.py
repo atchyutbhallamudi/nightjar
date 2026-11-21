@@ -61,7 +61,8 @@ FLAGS: Dict[str, Any] = {
     "ranges": {"gun": 85.0, "laser": 110.0, "lightning": 28.0},  # preferred fight distance per weapon for pos_score
     "slew": 0.05,          # fire when the torso will be on target within this many seconds of turning
     "gun_first": False,    # with gun + laser, aim the gun until the laser is nearly charged
-    "spin": 6.0,          # when idle, spend 2 s of every this-many seconds turning the torso a full circle (0 = off)
+    "spin": 6.0,           # when idle, spend 2 s of every this-many seconds turning the torso a full circle (0 = off)
+    "sidestep": 0,         # step out of the path of incoming bullets and laser lines; boost above this energy (0 = off)
 }
 
 
@@ -265,6 +266,15 @@ class Bot:
         if away is not None:
             move_yaw, move_mag, boost = away, 1.0, me["energy"] > 10
             mode = "dodge"
+        elif FLAGS["sidestep"] and self.hunt and mode != "zone":
+            # step out of the path of bullets that are about to hit, and off the line of a charging laser
+            sx, sy, beam = self._sidestep(obs, me)
+            if sx or sy:
+                vx = (math.cos(move_yaw) * move_mag * 0.4 if move_yaw is not None else 0.0) + sx * 0.9
+                vy = (math.sin(move_yaw) * move_mag * 0.4 if move_yaw is not None else 0.0) + sy * 0.9
+                move_yaw, move_mag = math.atan2(vy, vx), min(1.0, math.hypot(vx, vy))
+                if me["energy"] > (25 if beam else float(FLAGS["sidestep"])):
+                    boost = True
 
         # ---------------- steering
         jump = False
@@ -422,6 +432,47 @@ class Bot:
                 if math.hypot(mx, my) < 4.0 and abs(mz) < 6:
                     return True
         return False
+
+    def _sidestep(self, obs, me) -> Tuple[float, float, bool]:
+        """Unit direction that takes us out of the way of incoming fire, or (0, 0): sideways off the path of each
+        bullet that would pass through us within 0.7 s, and sideways off the aim line of a laser being charged at us."""
+        st = me.get("stats", {})
+        cx, cy = me["pos"][0], me["pos"][1]
+        cz = me["pos"][2] + float(st.get("height", 9)) * 0.56
+        reach = float(st.get("radius", 2.5)) + 1.1
+        dx = dy = 0.0
+        for p in obs.get("projectiles", []):
+            if p.get("kind") == "mortar":
+                continue
+            vx, vy, vz = p["vel"]
+            v2 = vx * vx + vy * vy + vz * vz
+            if v2 < 1:
+                continue
+            tc = ((cx - p["pos"][0]) * vx + (cy - p["pos"][1]) * vy + (cz - p["pos"][2]) * vz) / v2
+            if tc <= 0 or tc > 0.7:
+                continue
+            mx, my = p["pos"][0] + vx * tc - cx, p["pos"][1] + vy * tc - cy
+            vh = math.hypot(vx, vy)
+            if math.hypot(mx, my) < reach and vh >= 1:
+                px, py = -vy / vh, vx / vh
+                if px * mx + py * my > 0:  # step away from the side the bullet passes on
+                    px, py = -px, -py
+                dx += px
+                dy += py
+        beam = False
+        for m in obs.get("mechs", []):
+            if m.get("kind") != "mech" or not m.get("charging"):
+                continue
+            to_me = math.atan2(cy - m["pos"][1], cx - m["pos"][0])
+            if abs(wrap(m["aim"][0] - to_me)) > 0.15:
+                continue
+            dx += math.cos(to_me + math.pi / 2 * self.strafe_dir) * 1.5
+            dy += math.sin(to_me + math.pi / 2 * self.strafe_dir) * 1.5
+            beam = True
+        n = math.hypot(dx, dy)
+        if n > 0.01:
+            return dx / n, dy / n, beam
+        return 0.0, 0.0, False
 
     def _mortar_escape(self, obs, me) -> Optional[float]:
         """Yaw that carries us out of a visible mortar shell's predicted splash, or None."""
