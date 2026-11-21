@@ -64,6 +64,8 @@ FLAGS: Dict[str, Any] = {
     "spin": 6.0,           # when idle, spend 2 s of every this-many seconds turning the torso a full circle (0 = off)
     "sidestep": 0,         # step out of the path of incoming bullets and laser lines; boost above this energy (0 = off)
     "side_rel": False,     # sidestep judges bullets against our own motion too
+    "jet_scan": False,     # at the start, jet up while turning to spot weapons over the rooftops
+    "wait_laser": False,   # until we hold a laser and are above 80% HP, fight only attackers and mechs within 55 m
 }
 
 
@@ -153,6 +155,7 @@ class Bot:
         self.ffa = False
         self.hunt = False
         self.lose_t = -99.0
+        self.jet_scan = False
         self.stick_t = -99.0
         self.hit_me: Dict[Any, float] = {}
         # remembered loot: kind -> id -> (pos, weapon kind or "", time last seen)
@@ -304,6 +307,18 @@ class Bot:
             act["move"] = [0.0, 0.0]
         if t < self.unstick_until and not me["grounded"] and me["energy"] > 10:
             boost = True  # jet over the obstacle
+        if FLAGS["jet_scan"] and self.hunt and "laser" not in held and target is None:
+            # opening look-around from the air: sight is not blocked from above the rooftops, so a short jet while
+            # the torso turns shows where the weapons lie before the first hunter arrives
+            if me["grounded"] and t < 1.5 and me["energy"] >= 90 and not self.jet_scan:
+                jump = True
+                self.jet_scan = True
+            elif self.jet_scan and not me["grounded"] and me["energy"] > 35 and t < 8:
+                boost = True
+            elif self.jet_scan and (me["grounded"] and t > 2.0 or me["energy"] <= 35 or t >= 8):
+                self.jet_scan = False
+        else:
+            self.jet_scan = False
         act["boost"] = bool(boost)
         act["jump"] = bool(jump and me["grounded"])
 
@@ -668,6 +683,11 @@ class Bot:
             hit = t - self.hit_me.get(e["id"], -99.0)
             engage = d < 60 or hit < 6 or late or (closing > 3 and d < 180) or (hp < 0.4 * mhp and d < 160) or \
                 (aimed and d < 190) or e["id"] == self.target_id and t - self.stick_t < 2
+            if FLAGS["wait_laser"] and not late:
+                # start nothing until we hold a laser and are healthy: fight only what has hit us or is on top of us
+                armed = any(w and w["kind"] == "laser" for w in me["weapons"]) and me["hp"] >= 0.8 * me["max_hp"]
+                if not armed:
+                    engage = hit < 10 or d < 55
             if not engage:
                 continue
             if not self._los(me, e):
@@ -1335,7 +1355,7 @@ class Bot:
             p = max(recent, key=lambda v: v[0])[1]
             return math.atan2(p[1] - me["pos"][1], p[0] - me["pos"][0])
         spin = float(FLAGS["spin"])
-        if spin > 0 and self.hunt and (t % spin) < 2.0:
+        if self.jet_scan or (spin > 0 and self.hunt and (t % spin) < 2.0):
             # nothing known nearby: turn the torso all the way round every few seconds, so we spot weapons, crates
             # and anyone coming up behind us (vision is a 120 degree wedge; the legs keep walking where they were)
             return me["aim"][0] + 0.35
