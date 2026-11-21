@@ -63,6 +63,7 @@ FLAGS: Dict[str, Any] = {
     "gun_first": False,    # with gun + laser, aim the gun until the laser is nearly charged
     "spin": 6.0,           # when idle, spend 2 s of every this-many seconds turning the torso a full circle (0 = off)
     "sidestep": 0,         # step out of the path of incoming bullets and laser lines; boost above this energy (0 = off)
+    "side_rel": False,     # sidestep judges bullets against our own motion too
 }
 
 
@@ -445,13 +446,18 @@ class Bot:
             if p.get("kind") == "mortar":
                 continue
             vx, vy, vz = p["vel"]
-            v2 = vx * vx + vy * vy + vz * vz
+            # side_rel: judge the bullet against where we will be if we keep moving as we are (a shooter that
+            # leads us aims there), not against where we stand now
+            ux, uy, uz = vx, vy, vz
+            if FLAGS["side_rel"]:
+                ux, uy, uz = vx - me["vel"][0], vy - me["vel"][1], vz - me["vel"][2]
+            v2 = ux * ux + uy * uy + uz * uz
             if v2 < 1:
                 continue
-            tc = ((cx - p["pos"][0]) * vx + (cy - p["pos"][1]) * vy + (cz - p["pos"][2]) * vz) / v2
+            tc = ((cx - p["pos"][0]) * ux + (cy - p["pos"][1]) * uy + (cz - p["pos"][2]) * uz) / v2
             if tc <= 0 or tc > 0.7:
                 continue
-            mx, my = p["pos"][0] + vx * tc - cx, p["pos"][1] + vy * tc - cy
+            mx, my = p["pos"][0] + ux * tc - cx, p["pos"][1] + uy * tc - cy
             vh = math.hypot(vx, vy)
             if math.hypot(mx, my) < reach and vh >= 1:
                 px, py = -vy / vh, vx / vh
