@@ -76,8 +76,8 @@ FLAGS: Dict[str, Any] = {
     "fix_hunter": False,   # judge hunters by their own approach speed, not by ours
     "hold_drop": 0.0,      # stay in a supply ring we are capturing when this many seconds or fewer remain (0 = off)
     "det_nav": True,       # route search pauses after a fixed number of cells, not after a wall-clock time
-    "squad": False,        # hunt persona decided by squad.py (whole loop: engage, position, fire, loot)
-    "sq_laser_take": 0.45, # hunt core: fraction of a full laser charge at which the laser takes the aim from the gun
+    "squad": True,         # hunt persona decided by squad.py (whole loop: engage, position, fire, loot)
+    "sq_laser_take": 0.0,  # hunt core: fraction of a full laser charge at which the laser takes the aim from the gun
 }
 
 
