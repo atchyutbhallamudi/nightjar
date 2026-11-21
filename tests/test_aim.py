@@ -50,13 +50,15 @@ class Aim(unittest.TestCase):
 
     def test_gun_leads_a_crossing_target(self):
         b = bare_bot()
+        import bot as botmod
+        lat = float(botmod.FLAGS["lat"])  # the shot leaves this long after the observation it was aimed from
         yaw, pitch = b._direct_aim([0, 0, 7], [120, 0, 0], [0, 12, 0], 4.5, 252)
         best = 1e9
         for i in range(1, 4000):
             s = i * 0.0005
             bullet = [252 * s * math.cos(pitch) * math.cos(yaw), 252 * s * math.cos(pitch) * math.sin(yaw),
                       7 + 252 * s * math.sin(pitch)]
-            best = min(best, math.dist(bullet, [120, 12 * s, 4.5]))
+            best = min(best, math.dist(bullet, [120, 12 * (s + lat), 4.5]))
         self.assertLess(best, 0.3)
 
 
