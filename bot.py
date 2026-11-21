@@ -57,6 +57,8 @@ FLAGS: Dict[str, Any] = {
     "strafe_boost": 0,     # boost while strafing in a fight when energy is above this (0 = off)
     "fight_weapon": False, # leave a fight briefly for a laser or lightning within 80 m
     "lethal": False,       # release a partial laser charge when it already kills
+    "pos_score": False,    # choose each fight step by scoring nearby spots (range, line of fire, other enemies' sight)
+    "ranges": {"gun": 85.0, "laser": 110.0, "lightning": 28.0},  # preferred fight distance per weapon for pos_score
 }
 
 
@@ -757,6 +759,17 @@ class Bot:
                     wp, wd = pos, pd
             if wp is not None:
                 return self._nav_yaw(me, wp, t), 1.0, energy > 50
+        if self.hunt and FLAGS["pos_score"] and self.world is not None and self.nav is not None:
+            spot = self._fight_spot(me, target, d, held, obs, t, 17.0 if finishing else None)
+            if spot is not None:
+                yaw, mag = spot
+                boost = finishing and d > 40 and energy > 30
+                if FLAGS["strafe_boost"] and mag > 0:
+                    li = held.get("laser")
+                    charging = li is not None and me["weapons"][li].get("charge", 0) > 0
+                    if not charging and energy > (60 if "lightning" in held else float(FLAGS["strafe_boost"])):
+                        boost = True
+                return yaw, mag, boost
         radial = 0.0
         if d > hi:
             radial = 1.0
@@ -775,6 +788,105 @@ class Bot:
             if not charging and energy > (60 if "lightning" in held else float(FLAGS["strafe_boost"])):
                 boost = True
         return math.atan2(vy, vx), 1.0, boost
+
+    def _fight_spot(self, me, target, d, held, obs, t, want_range: Optional[float]) -> Optional[Tuple[float, float]]:
+        """Pick where to stand for the next moment of a fight: score the spot we are on and two rings of nearby
+        walkable spots, and head for the best. A good spot is at our weapon's range from the target, has a line
+        of fire while we can shoot (and none while the gun reloads), is out of sight of every other enemy, is
+        inside the zone, and lies in the direction we are strafing. Returns (yaw, speed 0..1) or None."""
+        w, nav = self.world, self.nav
+        x, y, z = me["pos"]
+        if abs(z - w.ground(x, y)) > 3.0:
+            return None  # on a roof or in the air: the ground grid does not describe where we are
+        st = me.get("stats", {})
+        mh = float(st.get("muzzle_height", 7))
+        body_h = float(st.get("height", 9)) * 0.6
+        weapons = me["weapons"]
+        gun = weapons[held["gun"]] if "gun" in held else None
+        laser = weapons[held["laser"]] if "laser" in held else None
+        light = weapons[held["lightning"]] if "lightning" in held else None
+        rng = dict(FLAGS["ranges"])
+        pref = rng["gun"]
+        if light is not None and me["energy"] > 12:
+            pref = rng["lightning"]
+        elif laser is not None:
+            pref = rng["laser"]
+        if light is None:
+            tw = target.get("weapons") or []
+            if "lightning" in tw:
+                pref = max(pref, 64.0)
+            if "mortar" in tw:
+                pref = max(pref, 80.0)
+        if want_range is not None:
+            pref = want_range
+        # can we shoot right now? with only a gun, step out of the line of fire while it reloads
+        ready = light is not None or laser is not None
+        if not ready and gun is not None:
+            ready = gun.get("ammo", 1) > 0 and gun.get("reload", 0) <= 0.25 and d <= gun["stats"].get("range", 230) - 10
+        want_los = 1.0 if ready else -1.0
+        _r, th = self._size(target)
+        tp = target["pos"]
+        tc = [tp[0], tp[1], tp[2] + th * 0.5]
+        others = []
+        for e in obs["mechs"]:
+            if e["kind"] == "mech" and e["id"] != target["id"] and e["id"] != me["id"]:
+                _er, eh = self._size(e)
+                others.append((dist2d(e["pos"], me["pos"]), [e["pos"][0], e["pos"][1], e["pos"][2] + eh * 8.0 / 9.0], e["pos"]))
+        others.sort(key=lambda o: o[0])
+        others = others[:3]
+        zn = self.zone_obs
+        zc = self._zone_circle(zn, t) if zn else None
+        cube = None
+        cube_d = 40.0
+        for pos, _k, _s in self.mem["c"].values():
+            cd = dist2d(pos, me["pos"])
+            if cd < cube_d and abs(pos[2] - z) < 4:
+                cube, cube_d = pos, cd
+        to_t = math.atan2(tp[1] - y, tp[0] - x)
+        sx, sy = math.cos(to_t + math.pi / 2 * self.strafe_dir), math.sin(to_t + math.pi / 2 * self.strafe_dir)
+        best_s, best = -1e18, (0.0, 0.0, 0.0)
+        side_blocked = False
+        for k in range(-1, 32):
+            if k < 0:
+                cx, cy, dx, dy, r = x, y, 0.0, 0.0, 0.0
+            else:
+                a = (k % 16) * math.pi / 8
+                r = 6.0 * (1 + k // 16)
+                dx, dy = math.cos(a), math.sin(a)
+                cx, cy = x + dx * r, y + dy * r
+                if not nav.line_free(x, y, cx, cy):
+                    if k < 16 and dx * sx + dy * sy > 0.9:
+                        side_blocked = True
+                    continue
+            cz = w.ground(cx, cy)
+            s = -1.1 * abs(math.hypot(tp[0] - cx, tp[1] - cy) - pref) - 0.4 * r
+            los = w.clear_line([cx, cy, cz + mh], tc)
+            if los:
+                s += 45.0 * want_los
+            body = [cx, cy, cz + body_h]
+            for _od, eye, opos in others:
+                if math.hypot(opos[0] - cx, opos[1] - cy) < 170 and w.clear_line(eye, body):
+                    s -= 30.0
+            if zc is not None:
+                out = math.hypot(cx - zc[0], cy - zc[1]) - zc[2]
+                if out > -5:
+                    s -= 150 + 5 * (out + 5)
+            if cube is not None:
+                s += 1.5 * (cube_d - math.hypot(cube[0] - cx, cube[1] - cy))
+            if want_los > 0:
+                s += 9.0 * (dx * sx + dy * sy)
+            if k < 0:
+                s -= 8.0
+                if want_los < 0 and not los:
+                    s += 14.0
+            if s > best_s:
+                best_s, best = s, (dx, dy, r)
+        if side_blocked:
+            self.strafe_dir = -self.strafe_dir
+            self.strafe_until = t + 0.5
+        if best[2] == 0.0:
+            return to_t, 0.0
+        return math.atan2(best[1], best[0]), 1.0
 
     def _retreat_move(self, me, threats, t, zone_goal) -> Tuple[float, float, bool]:
         x, y = me["pos"][0], me["pos"][1]
