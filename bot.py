@@ -77,6 +77,7 @@ FLAGS: Dict[str, Any] = {
     "hold_drop": 0.0,      # stay in a supply ring we are capturing when this many seconds or fewer remain (0 = off)
     "det_nav": True,       # route search pauses after a fixed number of cells, not after a wall-clock time
     "squad": False,        # hunt persona decided by squad.py (whole loop: engage, position, fire, loot)
+    "sq_laser_take": 0.45, # hunt core: fraction of a full laser charge at which the laser takes the aim from the gun
 }
 
 
@@ -159,6 +160,8 @@ class Bot:
         self.bad_pickups: Dict[Any, float] = {}
         self.threats: Dict[Any, Tuple[float, List[float]]] = {}
         self.squad = Squad(self) if Squad is not None else None
+        if self.squad is not None:
+            self.squad.laser_take = float(FLAGS["sq_laser_take"])
         self.squad_errors = 0
         self.slow_ticks = 0
         # persona: "hunt" until a mech dies that we did not kill, which only happens in a real free-for-all

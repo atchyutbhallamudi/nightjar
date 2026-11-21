@@ -64,6 +64,7 @@ class Squad:
         self.max_target = 240.0
         self.range_gun, self.range_laser, self.range_light = 85.0, 120.0, 28.0
         self.loot_radius, self.laser_seek = 150.0, 240.0
+        self.laser_take = 0.45      # fraction of a full charge at which the laser takes the aim from the gun
 
     # ------------------------------------------------------------------ small helpers
 
@@ -767,7 +768,7 @@ class Squad:
                             continue
                     if charge < full - 0.051:
                         fire[i] = True
-                        if charge > full * 0.45:
+                        if charge >= full * self.laser_take:
                             aim = [hy, hp_]
                     else:
                         aim = [hy, hp_]
