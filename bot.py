@@ -59,6 +59,7 @@ FLAGS: Dict[str, Any] = {
     "lethal": False,       # release a partial laser charge when it already kills
     "pos_score": False,    # choose each fight step by scoring nearby spots (range, line of fire, other enemies' sight)
     "ranges": {"gun": 85.0, "laser": 110.0, "lightning": 28.0},  # preferred fight distance per weapon for pos_score
+    "slew": 0.0,           # fire when the torso will be on target within this many seconds of turning
 }
 
 
@@ -1134,9 +1135,14 @@ class Bot:
             speed = gun["stats"]["speed"] if gun else 250.0
             aim = self._direct_aim(muzzle, tgt, vel, center_z, speed)
 
+        mst = me.get("stats", {})
+        slew = float(FLAGS["slew"])  # seconds of torso turn we count on before the shot leaves
+        slew_y = float(mst.get("turn_rate", 4)) * slew
+        slew_p = float(mst.get("pitch_rate", 3)) * slew
+
         def on_target(want: List[float], tol: float) -> bool:
-            ey = wrap(want[0] - my_aim[0])
-            ep = want[1] - my_aim[1]
+            ey = max(0.0, abs(wrap(want[0] - my_aim[0])) - slew_y)
+            ep = max(0.0, abs(want[1] - my_aim[1]) - slew_p)
             return d3 * math.hypot(ey * math.cos(want[1]), ep) < tol
 
         # gun
