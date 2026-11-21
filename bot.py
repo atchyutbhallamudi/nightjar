@@ -61,6 +61,7 @@ FLAGS: Dict[str, Any] = {
     "ranges": {"gun": 85.0, "laser": 110.0, "lightning": 28.0},  # preferred fight distance per weapon for pos_score
     "slew": 0.05,          # fire when the torso will be on target within this many seconds of turning
     "gun_first": False,    # with gun + laser, aim the gun until the laser is nearly charged
+    "spin": 0.0,           # when idle, spend 2 s of every this-many seconds turning the torso a full circle (0 = off)
 }
 
 
@@ -1276,6 +1277,11 @@ class Bot:
         if recent:
             p = max(recent, key=lambda v: v[0])[1]
             return math.atan2(p[1] - me["pos"][1], p[0] - me["pos"][0])
+        spin = float(FLAGS["spin"])
+        if spin > 0 and self.hunt and (t % spin) < 2.0:
+            # nothing known nearby: turn the torso all the way round every few seconds, so we spot weapons, crates
+            # and anyone coming up behind us (vision is a 120 degree wedge; the legs keep walking where they were)
+            return me["aim"][0] + 0.35
         base = move_yaw if move_yaw is not None else me["aim"][0]
         return base + 1.0 * math.sin(t * 1.1)
 
