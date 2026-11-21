@@ -1,7 +1,7 @@
-# mech-royale
+# nightjar
 
-A bot for the **Mech Royale** track of the Builders Buildathon (Nov 20–22, 2026). It pilots one mech in a
-16-mech battle royale. Score = mean of `16 − place` per match, so surviving matters more than kills.
+A game bot for a 16-player arena match. Score = mean of `16 − place` per match, so surviving matters more
+than kills.
 
 ## How the bot plays
 
@@ -49,11 +49,11 @@ Edges taken straight from the rules:
 
 You need Python 3.9+ (3.13 recommended). Docker is optional locally; the scorer builds the image itself.
 
-1. Download the starter kit (the bot's tests use its recorded match and map) and unpack it into `kit/`:
+1. Download the starter kit from the event's track page (the bot's tests use its recorded match and map)
+   and unpack it into `kit/`:
 
    ```powershell
-   curl.exe -L -o mechfight-kit.tar.gz https://www.joinbuilders.org/buildathon/tracks/builders/files/mechfight-kit.tar.gz
-   mkdir kit; tar -xzf mechfight-kit.tar.gz -C kit --strip-components=1
+   mkdir kit; tar -xzf <starter-kit>.tar.gz -C kit --strip-components=1
    ```
 
 2. Run the tests, the replay, and the organizers' conformance check:
@@ -75,11 +75,11 @@ You need Python 3.9+ (3.13 recommended). Docker is optional locally; the scorer 
 ## Submit
 
 1. Push this repository to a **public** GitHub repo, with `Dockerfile` at the top level (max 20 MB).
-2. Sign in at https://www.joinbuilders.org/buildathon, open the Mech Royale track page, and submit the repo URL.
+2. Sign in on the event site, open the track page, and submit the repo URL.
 3. Each submission is built, checked, and scored over 48 practice matches (4 submissions per hour per team).
 4. Keep the repo public, with every submitted commit, until results are published.
 
 ## Credits and license
 
-`mechfight.py` comes from the organizers' `mechfight-kit`. Everything else is released under the MIT License
-(see `LICENSE`), as the Buildathon rules require.
+`mechfight.py` is the organizers' protocol wrapper from the starter kit. Everything else is released under the
+MIT License (see `LICENSE`), as the event rules require.
