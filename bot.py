@@ -60,6 +60,7 @@ FLAGS: Dict[str, Any] = {
     "pos_score": False,    # choose each fight step by scoring nearby spots (range, line of fire, other enemies' sight)
     "ranges": {"gun": 85.0, "laser": 110.0, "lightning": 28.0},  # preferred fight distance per weapon for pos_score
     "slew": 0.0,           # fire when the torso will be on target within this many seconds of turning
+    "gun_first": False,    # with gun + laser, aim the gun until the laser is nearly charged
 }
 
 
@@ -1118,8 +1119,15 @@ class Bot:
 
         # primary weapon decides the aim this tick
         primary = "gun"
-        if laser and los and d3 <= laser["stats"].get("range", 280) and \
-                (laser.get("charge", 0) > 0 or (laser["cooldown"] < 0.3 and not retreating)):
+        laser_ok = bool(laser and los and d3 <= laser["stats"].get("range", 280))
+        # gun_first: keep the gun aimed and firing through the laser's cooldown and the first part of its charge,
+        # and only swing to the beam's straight line once the charge is nearly worth releasing
+        gun_first = bool(FLAGS["gun_first"]) and self.hunt and is_mech and gun is not None and \
+            gun.get("ammo", 0) > 0 and not gun.get("reload")
+        if gun_first and laser_ok:
+            if laser.get("charge", 0) > 0.45 * laser["stats"].get("charge", 0.75):
+                primary = "laser"
+        elif laser_ok and (laser.get("charge", 0) > 0 or (laser["cooldown"] < 0.3 and not retreating)):
             primary = "laser"
         elif mortar and is_mech and mortar["cooldown"] <= 0.1 and 25 < d3 < 220 and (not los or (gun and gun.get("reload", 0) > 0)):
             primary = "mortar"
@@ -1174,6 +1182,8 @@ class Bot:
                     fire[laser_i] = True
                 elif charge > 0:
                     fire[laser_i] = not on_target(aim, radius * 0.7)
+            elif gun_first and laser_ok and not retreating and laser["cooldown"] <= 0.05 and charge < full - 0.02:
+                fire[laser_i] = True  # charge the beam while the gun does the aiming
             else:
                 self._hold_laser(me, held, fire, release=retreating)
 
