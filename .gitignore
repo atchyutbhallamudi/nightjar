@@ -1,0 +1,18 @@
+# Organizers' starter kit (download it yourself, see README). Not ours to republish.
+kit/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Secrets (none are needed, but never commit them)
+.env
+.env.*
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
