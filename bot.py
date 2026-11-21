@@ -66,6 +66,7 @@ FLAGS: Dict[str, Any] = {
     "side_rel": False,     # sidestep judges bullets against our own motion too
     "jet_scan": False,     # at the start, jet up while turning to spot weapons over the rooftops
     "wait_laser": False,   # until we hold a laser and are above 80% HP, fight only attackers and mechs within 55 m
+    "plan": False,         # fight movement by 0.8 s look-ahead (range band, line of fire, exposure, bullets, smoothness)
 }
 
 
@@ -155,6 +156,8 @@ class Bot:
         self.ffa = False
         self.hunt = False
         self.lose_t = -99.0
+        self.plan_dir: Optional[Tuple[float, float]] = None
+        self.plan_t = -99.0
         self.jet_scan = False
         self.stick_t = -99.0
         self.hit_me: Dict[Any, float] = {}
@@ -839,6 +842,18 @@ class Bot:
                     wp, wd = pos, pd
             if wp is not None:
                 return self._nav_yaw(me, wp, t), 1.0, energy > 50
+        if self.hunt and FLAGS["plan"] and self.world is not None and self.nav is not None:
+            plan = self._fight_plan(me, target, d, los, held, obs, t, 17.0 if finishing else None)
+            if plan is not None:
+                yaw, mag, boost = plan
+                if finishing and d > 40 and energy > 30:
+                    boost = True
+                if FLAGS["strafe_boost"] and mag > 0 and los:
+                    li = held.get("laser")
+                    charging = li is not None and me["weapons"][li].get("charge", 0) > 0
+                    if not charging and energy > (60 if "lightning" in held else float(FLAGS["strafe_boost"])):
+                        boost = True
+                return yaw, mag, boost
         if self.hunt and FLAGS["pos_score"] and self.world is not None and self.nav is not None:
             spot = self._fight_spot(me, target, d, held, obs, t, 17.0 if finishing else None)
             if spot is not None:
@@ -868,6 +883,160 @@ class Bot:
             if not charging and energy > (60 if "lightning" in held else float(FLAGS["strafe_boost"])):
                 boost = True
         return math.atan2(vy, vx), 1.0, boost
+
+    def _fight_plan(self, me, target, d, los_now, held, obs, t, want_range: Optional[float]) -> Optional[Tuple[float, float, bool]]:
+        """Choose the next 0.8 s of fight movement by looking ahead. Each candidate (stand, 16 walking directions,
+        8 boosting directions when under fire) is judged by where it leaves us: inside the weapon's range band,
+        with a line of fire on the target, out of the sights of other mechs in proportion to how hard they could
+        hit us from there, clear of bullets already in the air (measured against the candidate's own motion),
+        sideways to the target, and not a sharp change from how we are already moving.
+        Returns (yaw, speed 0..1, boost) or None when we are not on the ground grid."""
+        w, nav = self.world, self.nav
+        x, y, z = me["pos"]
+        if abs(z - w.ground(x, y)) > 3.0:
+            return None
+        if not nav.free(*nav.to_cell(x, y)):
+            return None  # hard against a wall: the grid calls every step from here blocked, so let the plain strafe steer
+        st = me.get("stats", {})
+        walk = float(st.get("walk_speed", 11.7))
+        fast = float(st.get("boost_speed", 19.5))
+        mh = float(st.get("muzzle_height", 7))
+        body_h = float(st.get("height", 9)) * 0.6
+        my_r = float(st.get("radius", 2.5))
+        horizon = 0.8
+        rng = FLAGS["ranges"]
+        pref = rng["gun"]
+        if "lightning" in held and me["energy"] > 12:
+            pref = rng["lightning"]
+        elif "laser" in held:
+            pref = rng["laser"]
+        tw = target.get("weapons") or []
+        if "lightning" not in held:
+            if "lightning" in tw:
+                pref = max(pref, 64.0)
+            if "mortar" in tw:
+                pref = max(pref, 80.0)
+        if want_range is not None:
+            pref = want_range
+        band = 8.0 if want_range is None else 3.0
+        _tr, th = self._size(target)
+        tp = target["pos"]
+        tc = [tp[0], tp[1], tp[2] + th * 0.5]
+        to_t = math.atan2(tp[1] - y, tp[0] - x)
+        sx, sy = math.cos(to_t + math.pi / 2 * self.strafe_dir), math.sin(to_t + math.pi / 2 * self.strafe_dir)
+        # everyone who could shoot us: (eye, pos, aim yaw, base damage rate, charging a laser, weight)
+        threats = []
+        for e in obs["mechs"]:
+            if e["kind"] != "mech" or e["id"] == me["id"]:
+                continue
+            ed = dist2d(e["pos"], me["pos"])
+            if ed > 230:
+                continue
+            _er, eh = self._size(e)
+            ew = e.get("weapons") or []
+            rate = 120.0 if "laser" in ew else 150.0
+            if "lightning" in ew and ed < 50:
+                rate = 200.0
+            weight = 0.2 if e["id"] == target["id"] else 1.0  # we choose to stand in our own target's sights
+            threats.append((ed, [e["pos"][0], e["pos"][1], e["pos"][2] + eh * 8.0 / 9.0], e["pos"], e["aim"][0], rate,
+                            bool(e.get("charging")), weight))
+        threats.sort(key=lambda q: q[0])
+        threats = threats[:5]
+        bullets = [p for p in obs.get("projectiles", []) if p.get("kind") != "mortar"]
+        hurt = t - self.last_hurt_t < 1.5
+        under_fire = hurt or bool(bullets) or any(q[5] for q in threats)
+        reserve = 45.0 if "lightning" in held else 25.0
+        can_boost = under_fire and me["energy"] > reserve and me.get("grounded", True)
+        zn = self.zone_obs
+        zc = self._zone_circle(zn, t) if zn else None
+        cube, cube_d = None, 40.0
+        for pos, _k, _s in self.mem["c"].values():
+            cd = dist2d(pos, me["pos"])
+            if cd < cube_d and abs(pos[2] - z) < 4:
+                cube, cube_d = pos, cd
+        vx0, vy0 = me["vel"][0], me["vel"][1]
+        sp0 = math.hypot(vx0, vy0)
+        aimed = abs(wrap(target["aim"][0] - (to_t + math.pi))) < 0.35 and d >= 30 and los_now
+        cz_now = z + float(st.get("height", 9)) * 0.56
+        best_s, best = -1e18, (to_t, 0.0, False)
+        best_dir = None
+        n_ok = 0
+        side_blocked = False
+        n = 24 if can_boost else 16
+        for k in range(-1, n):
+            if k < 0:
+                dx = dy = spd = 0.0
+            elif k < 16:
+                a = k * math.pi / 8
+                dx, dy, spd = math.cos(a), math.sin(a), walk
+            else:
+                a = (k - 16) * math.pi / 4 + math.pi / 8
+                dx, dy, spd = math.cos(a), math.sin(a), fast
+            r = spd * horizon * 0.85
+            cx, cy = x + dx * r, y + dy * r
+            if k >= 0 and not nav.line_free(x, y, cx, cy):
+                if k < 16 and dx * sx + dy * sy > 0.9:
+                    side_blocked = True
+                continue
+            cz = w.ground(cx, cy)
+            s = -1.5 * max(0.0, abs(math.hypot(tp[0] - cx, tp[1] - cy) - pref) - band)
+            los = w.clear_line([cx, cy, cz + mh], tc)
+            if los:
+                s += 30.0
+            body = [cx, cy, cz + body_h]
+            for _ed, eye, epos, eaim, rate, charging, weight in threats:
+                td = math.hypot(epos[0] - cx, epos[1] - cy)
+                if td > 230 or not w.clear_line(eye, body):
+                    continue
+                off = abs(wrap(eaim - math.atan2(cy - epos[1], cx - epos[0])))
+                align = max(0.0, 1.0 - off / 0.7)
+                s -= weight * 0.5 * rate * (0.4 + 0.6 * align) * horizon * (1.0 if td < 150 else 0.5)
+                if charging and align > 0.3:
+                    s -= 0.8 * 252.0 * (weight if weight == 1.0 else 0.6)  # be out of sight when the beam is let go
+            cvx, cvy = dx * spd, dy * spd
+            for p in bullets:
+                ux, uy, uz = p["vel"][0] - cvx, p["vel"][1] - cvy, p["vel"][2]
+                u2 = ux * ux + uy * uy + uz * uz
+                if u2 < 1:
+                    continue
+                tca = ((x - p["pos"][0]) * ux + (y - p["pos"][1]) * uy + (cz_now - p["pos"][2]) * uz) / u2
+                if 0 < tca <= horizon:
+                    miss = math.hypot(p["pos"][0] + ux * tca - x, p["pos"][1] + uy * tca - y)
+                    if miss < my_r + 1.5:
+                        s -= 1.2 * 45.0 * (1.0 - miss / (my_r + 1.5))
+            if zc is not None:
+                out = math.hypot(cx - zc[0], cy - zc[1]) - zc[2]
+                if out > -5:
+                    s -= 150 + 5 * (out + 5)
+            if cube is not None:
+                s += 1.5 * (cube_d - math.hypot(cube[0] - cx, cube[1] - cy))
+            if k >= 0:
+                s += (22.0 if aimed else 9.0) * (dx * sx + dy * sy)
+                if sp0 > 1:
+                    s += 3.0 * (dx * vx0 + dy * vy0) / sp0
+                if k >= 16:
+                    s -= 3.4
+            else:
+                s -= 1.0 + (22.0 if hurt else 0.0)
+            if k >= 0 and self.plan_dir is not None and t - self.plan_t < 0.35:
+                # stay with the heading we chose last time unless another is clearly better: a mover that keeps
+                # changing its mind ends up nearly standing still
+                s += 14.0 * max(0.0, dx * self.plan_dir[0] + dy * self.plan_dir[1])
+            if s > best_s:
+                best_s, best = s, (math.atan2(dy, dx) if k >= 0 else to_t, 1.0 if k >= 0 else 0.0, k >= 16)
+                best_dir = (dx, dy) if k >= 0 else None
+                n_ok += k >= 0
+            elif k >= 0:
+                n_ok += 1
+        if n_ok < 4:
+            return None  # nearly boxed in: no real choice to weigh, use the plain strafe and its wall steering
+        self.plan_dir, self.plan_t = best_dir, t
+        if side_blocked and t - self.last_flip > 2.0:
+            # the way we were strafing is walled off: turn round once and keep going that way
+            self.strafe_dir = -self.strafe_dir
+            self.strafe_until = t + self.rng.uniform(3.0, 5.0)
+            self.last_flip = t
+        return best
 
     def _fight_spot(self, me, target, d, held, obs, t, want_range: Optional[float]) -> Optional[Tuple[float, float]]:
         """Pick where to stand for the next moment of a fight: score the spot we are on and two rings of nearby
