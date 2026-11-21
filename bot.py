@@ -71,7 +71,7 @@ FLAGS: Dict[str, Any] = {
     "fix_head": False,     # aim at the visible upper body when the centre is behind cover
     "fix_hunter": False,   # judge hunters by their own approach speed, not by ours
     "hold_drop": 0.0,      # stay in a supply ring we are capturing when this many seconds or fewer remain (0 = off)
-    "det_nav": False,      # route search pauses after a fixed number of cells, not after a wall-clock time
+    "det_nav": True,       # route search pauses after a fixed number of cells, not after a wall-clock time
 }
 
 
