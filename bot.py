@@ -67,6 +67,8 @@ FLAGS: Dict[str, Any] = {
     "jet_scan": False,     # at the start, jet up while turning to spot weapons over the rooftops
     "wait_laser": False,   # until we hold a laser and are above 80% HP, fight only attackers and mechs within 55 m
     "plan": False,         # fight movement by 0.8 s look-ahead (range band, line of fire, exposure, bullets, smoothness)
+    "fixes": True,         # fire check uses the commanded torso; aim at the visible part; hunters judged by their own approach
+    "hold_drop": 0.0,      # stay in a supply ring we are capturing when this many seconds or fewer remain (0 = off)
 }
 
 
@@ -229,6 +231,21 @@ class Bot:
         mode = "roam"
         loot_target: Optional[Dict[str, Any]] = None  # crate or drone to shoot when no enemy
 
+        # A supply drop we are already standing in and about to win: full HP, full energy and 3 cubes are worth
+        # a few more seconds on the spot, as long as nobody else is in the ring to freeze the clock.
+        hold_drop = None
+        if FLAGS["hold_drop"]:
+            for dr in obs.get("drops", []):
+                ring = float(dr.get("radius", 8))
+                if float(dr.get("lands_in", 1)) > 0 or dr.get("holder") not in (None, me["id"]):
+                    continue
+                if dist2d(dr["pos"], me["pos"]) > ring - 0.5:
+                    continue
+                left = float(dr.get("capture_s", 4)) - float(dr.get("progress", 0))
+                crowded = any(dist2d(e["pos"], dr["pos"]) < ring + 3 for e in enemies)
+                if left <= float(FLAGS["hold_drop"]) and not crowded and hp_frac > 0.2:
+                    hold_drop = dr
+
         if not me["in_zone"] or zone_urgent:
             mode = "zone"
             self._zone_watchdog(me, zone_goal, t)
@@ -238,6 +255,11 @@ class Bot:
                 move_yaw = math.atan2(zone_goal[1] - me["pos"][1], zone_goal[0] - me["pos"][0])
                 self.climbing = True
             boost = (not me["in_zone"]) or me["energy"] > 60
+        elif hold_drop is not None:
+            mode = "drop"
+            dd = dist2d(hold_drop["pos"], me["pos"])
+            move_yaw = math.atan2(hold_drop["pos"][1] - me["pos"][1], hold_drop["pos"][0] - me["pos"][0])
+            move_mag = 1.0 if dd > 3 else (0.4 if dd > 1 else 0.0)
         elif self.retreating and (target is not None or self.threats):
             # keep hiding from enemies we saw in the last few seconds, even once they drop out of view
             mode = "retreat"
@@ -682,6 +704,10 @@ class Bot:
             closing = 0.0
             if d > 1:
                 closing = -((e["vel"][0] - me["vel"][0]) * dx + (e["vel"][1] - me["vel"][1]) * dy) / d
+                if FLAGS["fixes"]:
+                    # count only the enemy's own approach: our walking toward a mech that is standing still
+                    # does not make it a hunter
+                    closing = -(e["vel"][0] * dx + e["vel"][1] * dy) / d
             aimed = abs(wrap(e["aim"][0] - math.atan2(-dy, -dx))) < 0.22
             hit = t - self.hit_me.get(e["id"], -99.0)
             engage = d < 60 or hit < 6 or late or (closing > 3 and d < 180) or (hp < 0.4 * mhp and d < 160) or \
@@ -843,17 +869,16 @@ class Bot:
             if wp is not None:
                 return self._nav_yaw(me, wp, t), 1.0, energy > 50
         if self.hunt and FLAGS["plan"] and self.world is not None and self.nav is not None:
-            plan = self._fight_plan(me, target, d, los, held, obs, t, 17.0 if finishing else None)
+            # decide the speed first, so the look-ahead weighs the move we will really make
+            fast_all = finishing and d > 40 and energy > 30
+            if FLAGS["strafe_boost"] and los:
+                li = held.get("laser")
+                charging = li is not None and me["weapons"][li].get("charge", 0) > 0
+                if not charging and energy > (60 if "lightning" in held else float(FLAGS["strafe_boost"])):
+                    fast_all = True
+            plan = self._fight_plan(me, target, d, los, held, obs, t, 17.0 if finishing else None, fast_all)
             if plan is not None:
-                yaw, mag, boost = plan
-                if finishing and d > 40 and energy > 30:
-                    boost = True
-                if FLAGS["strafe_boost"] and mag > 0 and los:
-                    li = held.get("laser")
-                    charging = li is not None and me["weapons"][li].get("charge", 0) > 0
-                    if not charging and energy > (60 if "lightning" in held else float(FLAGS["strafe_boost"])):
-                        boost = True
-                return yaw, mag, boost
+                return plan
         if self.hunt and FLAGS["pos_score"] and self.world is not None and self.nav is not None:
             spot = self._fight_spot(me, target, d, held, obs, t, 17.0 if finishing else None)
             if spot is not None:
@@ -884,7 +909,8 @@ class Bot:
                 boost = True
         return math.atan2(vy, vx), 1.0, boost
 
-    def _fight_plan(self, me, target, d, los_now, held, obs, t, want_range: Optional[float]) -> Optional[Tuple[float, float, bool]]:
+    def _fight_plan(self, me, target, d, los_now, held, obs, t, want_range: Optional[float],
+                    fast_all: bool = False) -> Optional[Tuple[float, float, bool]]:
         """Choose the next 0.8 s of fight movement by looking ahead. Each candidate (stand, 16 walking directions,
         8 boosting directions when under fire) is judged by where it leaves us: inside the weapon's range band,
         with a line of fire on the target, out of the sights of other mechs in proportion to how hard they could
@@ -962,7 +988,7 @@ class Bot:
         best_dir = None
         n_ok = 0
         side_blocked = False
-        n = 24 if can_boost else 16
+        n = 24 if (can_boost and not fast_all) else 16  # fast_all: every move is a boosted one, so weigh them as such
         t_start = time.perf_counter()
         for k in range(-1, n):
             if k >= 8 and time.perf_counter() - t_start > 0.020:
@@ -971,7 +997,7 @@ class Bot:
                 dx = dy = spd = 0.0
             elif k < 16:
                 a = k * math.pi / 8
-                dx, dy, spd = math.cos(a), math.sin(a), walk
+                dx, dy, spd = math.cos(a), math.sin(a), (fast if fast_all else walk)
             else:
                 a = (k - 16) * math.pi / 4 + math.pi / 8
                 dx, dy, spd = math.cos(a), math.sin(a), fast
@@ -1026,7 +1052,8 @@ class Bot:
                 # changing its mind ends up nearly standing still
                 s += 14.0 * max(0.0, dx * self.plan_dir[0] + dy * self.plan_dir[1])
             if s > best_s:
-                best_s, best = s, (math.atan2(dy, dx) if k >= 0 else to_t, 1.0 if k >= 0 else 0.0, k >= 16)
+                best_s, best = s, (math.atan2(dy, dx) if k >= 0 else to_t, 1.0 if k >= 0 else 0.0,
+                                   k >= 16 or (fast_all and k >= 0))
                 best_dir = (dx, dy) if k >= 0 else None
                 n_ok += k >= 0
             elif k >= 0:
@@ -1353,8 +1380,14 @@ class Bot:
         center_z = tgt[2] + height * 0.5
         muzzle = self._muzzle(me)
         d3 = math.dist(muzzle, [tgt[0], tgt[1], center_z])
-        los = self._clear_to(me, [tgt[0], tgt[1], center_z]) or (
-            obj.get("kind") != "crate" and self._clear_to(me, [tgt[0], tgt[1], tgt[2] + height * 0.85]))
+        c_clear = self._clear_to(me, [tgt[0], tgt[1], center_z])
+        u_clear = (not c_clear) and obj.get("kind") != "crate" and \
+            self._clear_to(me, [tgt[0], tgt[1], tgt[2] + height * 0.85])
+        los = c_clear or u_clear
+        if u_clear and FLAGS["fixes"]:
+            # only the upper body shows over cover: aim at the part we can see, not at the wall in front of its middle
+            center_z = tgt[2] + height * 0.85
+            d3 = math.dist(muzzle, [tgt[0], tgt[1], center_z])
 
         laser_i = held.get("laser")
         light_i = held.get("lightning")
@@ -1398,9 +1431,19 @@ class Bot:
         slew_y = float(mst.get("turn_rate", 4)) * slew
         slew_p = float(mst.get("pitch_rate", 3)) * slew
 
+        # Both weapons leave along the one torso. Where it will point when the shot goes: its heading now, turned
+        # toward the aim we are commanding this decision (not toward whatever each weapon would have liked).
+        turn_y = max(-slew_y, min(slew_y, wrap(aim[0] - my_aim[0])))
+        turn_p = max(-slew_p, min(slew_p, aim[1] - my_aim[1]))
+        torso = [my_aim[0] + turn_y, my_aim[1] + turn_p]
+
         def on_target(want: List[float], tol: float) -> bool:
-            ey = max(0.0, abs(wrap(want[0] - my_aim[0])) - slew_y)
-            ep = max(0.0, abs(want[1] - my_aim[1]) - slew_p)
+            if FLAGS["fixes"]:
+                ey = abs(wrap(want[0] - torso[0]))
+                ep = abs(want[1] - torso[1])
+            else:
+                ey = max(0.0, abs(wrap(want[0] - my_aim[0])) - slew_y)
+                ep = max(0.0, abs(want[1] - my_aim[1]) - slew_p)
             return d3 * math.hypot(ey * math.cos(want[1]), ep) < tol
 
         # gun
