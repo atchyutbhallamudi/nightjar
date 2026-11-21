@@ -1,4 +1,4 @@
-"""Mech Royale bot.
+"""Arena bot.
 
 Plan each decision (10 per second):
   1. Read the world: enemies, loot, zone, recent damage and sounds.

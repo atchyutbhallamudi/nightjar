@@ -1,4 +1,4 @@
-"""Static map for Mech Royale: terrain heights, building prisms, and fast line-of-sight tests.
+"""Static arena map: terrain heights, building prisms, and fast line-of-sight tests.
 
 Coordinates follow protocol.md section 5: x east, y north, z up, meters.
 Map format follows protocol.md section 11 (v2/world.json + v2/terrain.i16).
