@@ -48,18 +48,18 @@ UPGRADE_PREF = [
 # Switches for scoring one change at a time.
 FLAGS: Dict[str, Any] = {
     "hunt": True,          # hunt persona while every death so far was our own kill (a squad that never fights itself)
-    "lat": 0.0,            # seconds of decision delay added to aim lead
+    "lat": 0.075,           # seconds of decision delay added to aim lead
     "bullet_dodge": False, # reverse strafe when a bullet is on course
     "gun_gate": 230.0,     # do not fire the gun at mechs beyond this many meters
     "finish": True,        # close in on a badly hurt target
     "fight_cubes": True,   # step onto nearby cubes while fighting
     "laser_walk": 250.0,   # how far to walk for a laser in hunt persona
-    "strafe_boost": 0,     # boost while strafing in a fight when energy is above this (0 = off)
-    "fight_weapon": False, # leave a fight briefly for a laser or lightning within 80 m
-    "lethal": False,       # release a partial laser charge when it already kills
+    "strafe_boost": 45,    # boost while strafing in a fight when energy is above this (0 = off)
+    "fight_weapon": True,  # leave a fight briefly for a laser or lightning within 80 m
+    "lethal": True,        # release a partial laser charge when it already kills
     "pos_score": False,    # choose each fight step by scoring nearby spots (range, line of fire, other enemies' sight)
     "ranges": {"gun": 85.0, "laser": 110.0, "lightning": 28.0},  # preferred fight distance per weapon for pos_score
-    "slew": 0.0,           # fire when the torso will be on target within this many seconds of turning
+    "slew": 0.05,          # fire when the torso will be on target within this many seconds of turning
     "gun_first": False,    # with gun + laser, aim the gun until the laser is nearly charged
 }
 
