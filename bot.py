@@ -30,6 +30,10 @@ try:
     from nav import NavGrid
 except Exception:
     NavGrid = None  # type: ignore
+try:
+    from squad import Squad
+except Exception:
+    Squad = None  # type: ignore
 
 TAU = 2 * math.pi
 
@@ -72,6 +76,7 @@ FLAGS: Dict[str, Any] = {
     "fix_hunter": False,   # judge hunters by their own approach speed, not by ours
     "hold_drop": 0.0,      # stay in a supply ring we are capturing when this many seconds or fewer remain (0 = off)
     "det_nav": True,       # route search pauses after a fixed number of cells, not after a wall-clock time
+    "squad": False,        # hunt persona decided by squad.py (whole loop: engage, position, fire, loot)
 }
 
 
@@ -153,6 +158,8 @@ class Bot:
         self.wander_until = 0.0
         self.bad_pickups: Dict[Any, float] = {}
         self.threats: Dict[Any, Tuple[float, List[float]]] = {}
+        self.squad = Squad(self) if Squad is not None else None
+        self.squad_errors = 0
         self.slow_ticks = 0
         # persona: "hunt" until a mech dies that we did not kill, which only happens in a real free-for-all
         self.start_alive: Optional[int] = None
@@ -249,7 +256,22 @@ class Bot:
                 if left <= float(FLAGS["hold_drop"]) and not crowded and hp_frac > 0.2:
                     hold_drop = dr
 
-        if not me["in_zone"] or zone_urgent:
+        # The hunt-mode core makes the whole decision (move, aim, fire, pickups); the code below only steers it
+        # round walls. If it fails for any reason, fall back to the older rules for this decision.
+        sq: Optional[Dict[str, Any]] = None
+        if self.hunt and FLAGS["squad"] and self.squad is not None and self.world is not None and self.nav is not None:
+            try:
+                sq = self.squad.decide(obs, me, t)
+            except Exception:
+                self.squad_errors += 1
+                if self.squad_errors <= 3:
+                    mf.log("hunt core failed, using fallback rules:\n" + traceback.format_exc())
+                sq = None
+        if sq is not None:
+            move_yaw, move_mag, boost, mode = sq["move_yaw"], sq["move_mag"], sq["boost"], sq["mode"]
+            if "pick" in sq:
+                act["pick"] = sq["pick"]
+        elif not me["in_zone"] or zone_urgent:
             mode = "zone"
             self._zone_watchdog(me, zone_goal, t)
             move_yaw = self._nav_yaw(me, zone_goal, t, zone=True)
@@ -351,17 +373,27 @@ class Bot:
         act["jump"] = bool(jump and me["grounded"])
 
         # ---------------- aim and fire
-        aim_obj = target if target is not None else loot_target
-        aim, fire, reload = self._aim_and_fire(me, aim_obj, held, t, mode, move_yaw)
-        act["aim"] = [round(aim[0], 4), round(aim[1], 4)]
-        act["fire"] = fire
-        if reload:
-            act["reload"] = True
+        if sq is not None:
+            act["aim"] = [round(sq["aim"][0], 4), round(sq["aim"][1], 4)]
+            act["fire"] = sq["fire"]
+            if sq.get("reload"):
+                act["reload"] = True
+            if "take" in sq:
+                act["take"] = sq["take"]
+                if "drop" in sq:
+                    act["drop"] = sq["drop"]
+        else:
+            aim_obj = target if target is not None else loot_target
+            aim, fire, reload = self._aim_and_fire(me, aim_obj, held, t, mode, move_yaw)
+            act["aim"] = [round(aim[0], 4), round(aim[1], 4)]
+            act["fire"] = fire
+            if reload:
+                act["reload"] = True
 
-        # ---------------- pickups in reach
-        take = self._take_pickup(obs, me, held, weapons, t)
-        if take:
-            act.update(take)
+            # ---------------- pickups in reach
+            take = self._take_pickup(obs, me, held, weapons, t)
+            if take:
+                act.update(take)
 
         mf.draw.label(f"{mode} hp{me['hp']:.0f} e{me['energy']:.0f} a{obs['alive']}")
         return act

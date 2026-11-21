@@ -4,7 +4,7 @@
 FROM python:3.13.18-slim
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 WORKDIR /bot
-COPY mechfight.py world.py nav.py bot.py ./
+COPY mechfight.py world.py nav.py squad.py bot.py ./
 # compile ahead of time so start-up is quick on the read-only disk
 RUN python -m compileall -q /bot && chmod -R a+rX /bot
 ENTRYPOINT ["python3", "-u", "/bot/bot.py"]
