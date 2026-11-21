@@ -45,9 +45,10 @@ class Prism:
                 return False
         return True
 
-    def blocks_segment(self, ax: float, ay: float, az: float, bx: float, by: float, bz: float) -> bool:
-        """True if the 3D segment a->b passes through this prism's solid."""
-        if min(az, bz) > self.top or max(az, bz) < self.base:
+    def blocks_segment(self, ax: float, ay: float, az: float, bx: float, by: float, bz: float,
+                       ignore_z: bool = False) -> bool:
+        """True if the 3D segment a->b passes through this prism's solid (with ignore_z: its footprint)."""
+        if not ignore_z and (min(az, bz) > self.top or max(az, bz) < self.base):
             return False
         if max(ax, bx) < self.minx or min(ax, bx) > self.maxx or max(ay, by) < self.miny or min(ay, by) > self.maxy:
             return False
@@ -73,6 +74,8 @@ class Prism:
                 continue
             tm = 0.5 * (t0 + t1)
             if self.contains_xy(ax + dx * tm, ay + dy * tm):
+                if ignore_z:
+                    return True
                 z0, z1 = az + dz * t0, az + dz * t1
                 if max(z0, z1) >= self.base and min(z0, z1) <= self.top:
                     return True
@@ -235,22 +238,49 @@ class World:
         """Line of fire / sight ignoring trees (trees never stop shots)."""
         return not self.building_between(a, b) and not self.terrain_between(a, b)
 
-    def wall_ahead(self, x: float, y: float, z: float, yaw: float, dist: float, clearance: float = 1.6) -> bool:
+    def wall_ahead(self, x: float, y: float, z: float, yaw: float, dist: float,
+                   step: float = 1.2, head: float = 9.0, half_width: float = 2.8) -> bool:
         """True if walking `dist` meters along `yaw` from feet (x, y, z) runs into a solid.
 
-        Probes the center line and both shoulders of the mech (radius 2.5 m) at knee and chest height."""
+        Probes the center line and both shoulders of the mech (radius 2.5 m, plus a margin) just above
+        step-up height (anything taller than 1.2 m is a wall) and just below head height (9 m)."""
         c, s = math.cos(yaw), math.sin(yaw)
         ex, ey = x + c * dist, y + s * dist
         if ex < self.minx + 4 or ex > self.maxx - 4 or ey < self.miny + 4 or ey > self.maxy - 4:
             return True
-        px, py = -s * 2.2, c * 2.2
-        for zz in (z + clearance, z + 6.0):
+        px, py = -s * half_width, c * half_width
+        for zz in (z + step + 0.1, z + head - 0.2):
             for ox, oy in ((0.0, 0.0), (px, py), (-px, -py)):
                 if self.building_between([x + ox, y + oy, zz], [ex + ox, ey + oy, zz]):
                     return True
         # steep ground counts as a wall too
         rise = self.ground(ex, ey) - max(z, self.ground(x, y))
         return rise > dist * 1.1 and rise > 1.5
+
+    def obstacle_top(self, x: float, y: float, z: float, yaw: float, dist: float, half_width: float = 2.8) -> Optional[float]:
+        """Height of the highest solid in the way of walking `dist` along `yaw` from feet (x, y, z), or None."""
+        c, s = math.cos(yaw), math.sin(yaw)
+        ex, ey = x + c * dist, y + s * dist
+        px, py = -s * half_width, c * half_width
+        top = None
+        for zz in (z + 1.3, z + 8.8):
+            for ox, oy in ((0.0, 0.0), (px, py), (-px, -py)):
+                a = [x + ox, y + oy, zz]
+                b = [ex + ox, ey + oy, zz]
+                for idx in self._cells_on_segment(a[0], a[1], b[0], b[1]):
+                    p = self.prisms[idx]
+                    if (top is None or p.top > top) and p.blocks_segment(a[0], a[1], a[2], b[0], b[1], b[2]):
+                        top = p.top
+        return top
+
+    def max_top_along(self, ax: float, ay: float, bx: float, by: float) -> float:
+        """Highest solid top whose footprint the 2D segment crosses (-inf if none): can we jet over this line?"""
+        top = -math.inf
+        for idx in self._cells_on_segment(ax, ay, bx, by):
+            p = self.prisms[idx]
+            if p.top > top and p.blocks_segment(ax, ay, 0.0, bx, by, 0.0, ignore_z=True):
+                top = p.top
+        return top
 
     def inside_solid(self, x: float, y: float, z: float) -> bool:
         i, j = self._cell(x, y)

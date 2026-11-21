@@ -19,16 +19,31 @@ Aiming leads moving targets for the gun, aims straight for the hitscan laser, an
 the mortar. It only fires when the torso is actually on target and no building or hill blocks the shot (`world.py`
 loads the map and does the line-of-sight math). Upgrades prefer armor, HP and regen, then damage.
 
+Edges taken straight from the rules:
+
+- **Route planning** (`nav.py`): a 4 m walkable grid of the campus (buildings, low bridges, steep terrain such as
+  the stadium banks) and A* spread over several decisions, so long trips never get trapped behind buildings.
+  Where no walkable route exists, it jets straight over the wall (full energy climbs about 60 m).
+- **Safe zone spot**: heads for open ground inside the next circle, or the roof if the center is inside a building.
+- **Target choice**: prefers nearly dead enemies (a kill is a placement), enemies showing their back (rear hits
+  do x1.5), enemies slowed by charging a laser, and mortar carriers when we hold a laser (cook-off +60%).
+- **Dodging**: runs out of a visible mortar shell's predicted splash; reverses strafe when a bullet is on course,
+  so shooters that lead our velocity miss.
+- **Healing discipline**: regeneration needs 5 s without dealing damage, so it does not shoot crates or drones
+  until healed (unless a drone is already shooting it).
+
 ## Files
 
 | Path | What it is |
 | --- | --- |
 | `bot.py` | The bot (entry point). |
 | `world.py` | Map loading: terrain height, buildings, line-of-sight and wall checks. |
+| `nav.py` | Walkable grid and time-sliced A* route planning. |
 | `mechfight.py` | The organizers' protocol wrapper from the starter kit, unchanged. |
 | `Dockerfile` | The image the scorer builds. Standard library only; no secrets or environment variables are needed. |
-| `tests/` | Unit tests: map checks against a recorded match, and aiming math. |
+| `tests/` | Unit tests: map checks against a recorded match, aiming math, and that the Dockerfile ships every module. |
 | `tools/replay.py` | Feeds the recorded match through the bot and prints its decisions (shows crashes the wrapper would hide). |
+| `tools/navsim.py` | Movement-only harness on the real map (no opponents): long trips, weapon pickups, full zone schedules. |
 
 ## Run and test locally
 
@@ -46,6 +61,7 @@ You need Python 3.9+ (3.13 recommended). Docker is optional locally; the scorer 
    ```powershell
    python -m unittest discover -s tests
    python tools/replay.py
+   python tools/navsim.py --runs 30
    python kit/check/check.py -- python -u bot.py
    ```
 

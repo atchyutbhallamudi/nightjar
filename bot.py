@@ -12,6 +12,7 @@ Rules and numbers come from hello.config (protocol.md); the map comes from hello
 """
 from __future__ import annotations
 
+import gc
 import math
 import random
 import time
@@ -20,10 +21,15 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import mechfight as mf
 
+# never let a map or routing problem stop the bot from answering; each degrades on its own
 try:
     from world import World
-except Exception:  # never let a map problem stop the bot from answering
+except Exception:
     World = None  # type: ignore
+try:
+    from nav import NavGrid
+except Exception:
+    NavGrid = None  # type: ignore
 
 TAU = 2 * math.pi
 
@@ -52,7 +58,7 @@ def unit(yaw: float) -> List[float]:
 
 
 class Bot:
-    name = "royale-v1"
+    name = "royale-v2"
 
     def __init__(self, hello: Dict[str, Any]) -> None:
         cfg = hello["config"]
@@ -65,6 +71,30 @@ class Bot:
                 self.world = World(m.get("dir", "/arena"), m.get("files"))
             except Exception:
                 mf.log("map load failed, playing without it:\n" + traceback.format_exc())
+        self.nav = None
+        if self.world is not None and NavGrid is not None:
+            try:
+                self.nav = NavGrid(self.world)
+            except Exception:
+                mf.log("route grid failed, steering locally only:\n" + traceback.format_exc())
+        self.path: Optional[List[Tuple[float, float]]] = None
+        self.path_goal: Optional[List[float]] = None
+        self.path_t = -99.0
+        self.search_goal: Optional[List[float]] = None
+        self.goal_key: Any = None
+        self.goal_best_d = 1e9
+        self.goal_best_t = 0.0
+        self.bad_goals: Dict[Any, float] = {}
+        self.last_flip = -99.0
+        self.climbing = False
+        self.zone_roof = False
+        self.zone_obs: Optional[Dict[str, Any]] = None
+        self.force: Optional[str] = None
+        self.force_until = 0.0
+        self.zprog_best = 1e9
+        self.zprog_t = 0.0
+        self.zprog_seen = -99.0
+        self._safe_cache: Dict[Any, Tuple[List[float], bool]] = {}
         self.reach = float(cfg["loot"]["pickup_radius"])
         self.cube_reach = float(cfg["cubes"].get("pickup_radius", 3.5))
         self.mech_r = float(cfg["mech"]["radius"])
@@ -94,6 +124,11 @@ class Bot:
         self.bad_pickups: Dict[Any, float] = {}
         self.threats: Dict[Any, Tuple[float, List[float]]] = {}
         self.slow_ticks = 0
+        # The map and route grid never change: move them out of the garbage collector's sight so its
+        # periodic full sweeps stay short (a long pause can blow the 50 ms answer budget).
+        gc.collect()
+        if hasattr(gc, "freeze"):
+            gc.freeze()
 
     # ------------------------------------------------------------------ main
 
@@ -112,11 +147,11 @@ class Bot:
         dt = max(0.0, min(0.5, t - self.prev_t))
         self.prev_t = t
         me = obs["self"]
-        x, y = me["pos"][0], me["pos"][1]
         hp_frac = me["hp"] / max(1.0, me["max_hp"])
         act: Dict[str, Any] = {"tick": obs["tick"]}
 
         self._read_events(obs, t)
+        self.zone_obs = obs.get("zone")
         if obs.get("offer"):
             act["pick"] = self._pick_upgrade(obs["offer"])
 
@@ -147,22 +182,28 @@ class Bot:
 
         if not me["in_zone"] or zone_urgent:
             mode = "zone"
-            move_yaw = math.atan2(zone_goal[1] - y, zone_goal[0] - x)
+            self._zone_watchdog(me, zone_goal, t)
+            move_yaw = self._nav_yaw(me, zone_goal, t, zone=True)
+            if self.zone_roof and dist2d(me["pos"], zone_goal) < 80:
+                # the safe spot is a rooftop: head straight for that building and jet up onto it
+                move_yaw = math.atan2(zone_goal[1] - me["pos"][1], zone_goal[0] - me["pos"][0])
+                self.climbing = True
             boost = (not me["in_zone"]) or me["energy"] > 60
         elif self.retreating and (target is not None or self.threats):
             # keep hiding from enemies we saw in the last few seconds, even once they drop out of view
             mode = "retreat"
-            remembered = [{"pos": p} for (seen_t, p) in self.threats.values()]
+            remembered = [{"pos": p} for (_seen, p) in self.threats.values()]
             move_yaw, move_mag, boost = self._retreat_move(me, near_enemies or remembered, t, zone_goal)
         elif target is not None:
             mode = "fight"
-            move_yaw, move_mag, boost = self._fight_move(me, target, tgt_d, tgt_los, held, enemies, t)
+            move_yaw, move_mag, boost = self._fight_move(me, target, tgt_d, tgt_los, held, obs, t)
         else:
-            goal, loot_target, why = self._loot_goal(obs, me, held, t, zone_goal, hp_frac, npcs)
+            goal, key, loot_target, why = self._loot_goal(obs, me, held, t, zone_goal, hp_frac, npcs)
             if goal is not None:
                 mode = why
                 d = dist2d(goal, me["pos"])
-                move_yaw = math.atan2(goal[1] - y, goal[0] - x)
+                self._track_goal(key, d, t)
+                move_yaw = self._nav_yaw(me, goal, t)
                 move_mag = 1.0 if d > 3 else 0.3
             elif self.last_damage and t - self.last_damage[0] < 3 and self.last_damage[1] is not None:
                 mode = "evade"
@@ -172,22 +213,38 @@ class Bot:
             else:
                 mode = "roam"
                 goal = self._wander_goal(obs, me, t, zone_goal)
-                move_yaw = math.atan2(goal[1] - y, goal[0] - x)
+                move_yaw = self._nav_yaw(me, goal, t)
                 # walking slowly is silent (protocol.md section 8)
                 move_mag = 0.4 if dist2d(goal, me["pos"]) < 120 else 1.0
+                if self.zone_roof and me["in_zone"]:
+                    move_mag = 0.0  # made it onto the safe roof: stay put rather than walk off the edge
 
-        # ---------------- dodge a laser that is charging at us
-        if target is not None and mode in ("fight", "retreat"):
-            for e in enemies:
-                if e.get("charging") and self._aimed_at_me(e, me):
-                    bearing = math.atan2(e["pos"][1] - y, e["pos"][0] - x)
-                    move_yaw = bearing + math.pi / 2 * self.strafe_dir
-                    move_mag, boost = 1.0, me["energy"] > 15
-                    break
+        # ---------------- get out from under a mortar shell (slow, predictable, 7 m splash)
+        away = self._mortar_escape(obs, me)
+        if away is not None:
+            move_yaw, move_mag, boost = away, 1.0, me["energy"] > 10
+            mode = "dodge"
 
         # ---------------- steering
         jump = False
-        if move_yaw is not None:
+        climb = self.climbing and mode in ("zone", "roam", "weapon", "cube", "drop", "loot")
+        if move_yaw is not None and climb and self.world is not None:
+            # Jet straight over whatever is in the way: wait (without boosting, which drains energy) until there is
+            # enough energy for this wall's height, jump, then jet only while the wall is still ahead.
+            px, py, pz = me["pos"]
+            top = self.world.obstacle_top(px, py, pz, move_yaw, 6.0)
+            if not me["grounded"]:
+                boost = top is not None and me["energy"] > 3
+            elif top is not None:
+                st = me.get("stats", {})
+                per_m = float(st.get("jet_drain", 15)) / max(1.0, float(st.get("max_rise_speed", 10)))
+                hop = float(st.get("jump_speed", 11)) ** 2 / (2 * float(st.get("gravity", 22)))
+                need = min(me["max_energy"] * 0.97, max(0.0, top - pz - hop) * per_m * 1.15 + 8)
+                jump = me["energy"] >= need
+                move_mag = 1.0 if jump else 0.0
+                boost = False
+            act["move"] = [round(math.cos(move_yaw) * move_mag, 3), round(math.sin(move_yaw) * move_mag, 3)]
+        elif move_yaw is not None:
             move_yaw, jump_needed = self._steer(me, move_yaw, t, dt, move_mag)
             jump = jump or jump_needed
             act["move"] = [round(math.cos(move_yaw) * move_mag, 3), round(math.sin(move_yaw) * move_mag, 3)]
@@ -274,18 +331,185 @@ class Bot:
     def _maybe_flip_strafe(self, t: float) -> None:
         if t >= self.strafe_until:
             self.strafe_dir = -self.strafe_dir if self.rng.random() < 0.7 else self.strafe_dir
-            self.strafe_until = t + self.rng.uniform(0.8, 2.2)
+            self.strafe_until = t + self.rng.uniform(0.6, 1.8)
+
+    def _bullet_incoming(self, obs, me) -> bool:
+        """An enemy bullet whose straight path passes within ~4 m of us, arriving in 0.15-1 s.
+        Reversing then makes a shooter that led our current velocity miss by several meters."""
+        cx, cy = me["pos"][0], me["pos"][1]
+        cz = me["pos"][2] + 4.5
+        vx, vy, vz = me["vel"]
+        for p in obs.get("projectiles", []):
+            if p.get("kind") not in ("gun", "npc"):
+                continue
+            rx, ry, rz = p["pos"][0] - cx, p["pos"][1] - cy, p["pos"][2] - cz
+            ux, uy, uz = p["vel"][0] - vx, p["vel"][1] - vy, p["vel"][2] - vz
+            uu = ux * ux + uy * uy + uz * uz
+            if uu < 1:
+                continue
+            tca = -(rx * ux + ry * uy + rz * uz) / uu
+            if 0.15 < tca < 1.0:
+                mx, my, mz = rx + ux * tca, ry + uy * tca, rz + uz * tca
+                if math.hypot(mx, my) < 4.0 and abs(mz) < 6:
+                    return True
+        return False
+
+    def _mortar_escape(self, obs, me) -> Optional[float]:
+        """Yaw that carries us out of a visible mortar shell's predicted splash, or None."""
+        w = self.world
+        if w is None:
+            return None
+        g = self.mortar_g
+        splash = float(self.cfg["weapons"]["mortar"].get("splash_radius", 7))
+        x, y = me["pos"][0], me["pos"][1]
+        best = None
+        for p in obs.get("projectiles", []):
+            if p.get("kind") != "mortar":
+                continue
+            px, py, pz = p["pos"]
+            vx, vy, vz = p["vel"]
+            land = None
+            for k in range(1, 100):
+                tt = k * 0.05
+                lx, ly = px + vx * tt, py + vy * tt
+                lz = pz + vz * tt - 0.5 * g * tt * tt
+                if lz <= w.ground(lx, ly) + 0.5:
+                    land = (lx, ly, tt)
+                    break
+            if land is None or land[2] > 4.0:
+                continue
+            d = math.hypot(x - land[0], y - land[1])
+            if d < splash + self.mech_r + 4 and (best is None or d < best[0]):
+                best = (d, land)
+        if best is None:
+            return None
+        d, (lx, ly, _) = best
+        if d < 0.5:
+            return math.atan2(obs["projectiles"][0]["vel"][1], obs["projectiles"][0]["vel"][0]) + math.pi / 2
+        return math.atan2(y - ly, x - lx)
+
+    def _zone_circle(self, zn: Dict[str, Any], t: float) -> Tuple[float, float, float]:
+        """The safe circle a few seconds from now (it slides from the current circle to the next while shrinking)."""
+        ss, se = float(zn["shrink_start"]), float(zn["shrink_end"])
+        c0, r0 = zn["center"], float(zn["radius"])
+        nc, nr = zn["next_center"], float(zn["next_radius"])
+        f = 0.0 if se <= ss else min(1.0, max(0.0, (t + 4.0 - ss) / (se - ss)))
+        return (c0[0] + (nc[0] - c0[0]) * f, c0[1] + (nc[1] - c0[1]) * f, max(0.0, r0 + (nr - r0) * f - 6.0))
+
+    def _nav_yaw(self, me, goal, t: float, zone: bool = False) -> float:
+        """Direction to walk toward `goal`, following an A* route around buildings when needed.
+        Routes avoid ground outside the safe circle, and are re-planned often while it shrinks.
+        Only when racing the zone (`zone`) may it jet over rooftops instead of a long walk around."""
+        x, y = me["pos"][0], me["pos"][1]
+        direct = math.atan2(goal[1] - y, goal[0] - x)
+        self.climbing = False
+        nav = self.nav
+        if nav is None:
+            return direct
+        if zone and self.force == "climb" and t < self.force_until:
+            self.climbing = True  # watchdog: walking made no progress, go straight over
+            return direct
+        d = math.hypot(goal[0] - x, goal[1] - y)
+        # close in (goal may sit right against a wall, inside a grid cell marked blocked) or in the open: go direct
+        if d < 15 or (d < 90 and nav.line_free(x, y, goal[0], goal[1])):
+            self.path = None
+            return direct
+        new_goal = self.path_goal is None or math.hypot(goal[0] - self.path_goal[0], goal[1] - self.path_goal[1]) > 6
+        zn = self.zone_obs
+        shrinking = zn is not None and float(zn["shrink_start"]) - 5 <= t <= float(zn["shrink_end"])
+        stale = t - self.path_t > (3.0 if shrinking else 12.0)
+        # self.path: None = no route yet, [] = no route exists (retry only once stale)
+        if new_goal or stale or self.path is None:
+            same_search = nav.searching() and self.search_goal is not None and \
+                math.hypot(goal[0] - self.search_goal[0], goal[1] - self.search_goal[1]) < 6
+            if not same_search:
+                keep = self._zone_circle(zn, t) if zn is not None else None
+                if not nav.start(x, y, goal[0], goal[1], keep=keep):
+                    self.path, self.path_goal, self.path_t = [], [goal[0], goal[1]], t
+                    return direct
+                self.search_goal = [goal[0], goal[1]]
+        if nav.searching():
+            res = nav.step(0.010)
+            if res is not None:
+                path = nav.smooth(res) if res else []
+                if path:
+                    walk = sum(math.hypot(path[i + 1][0] - path[i][0], path[i + 1][1] - path[i][1])
+                               for i in range(len(path) - 1))
+                    straight = math.hypot(goal[0] - x, goal[1] - y)
+                    forced_walk = self.force == "path" and t < self.force_until
+                    if zone and straight < 160 and walk > 1.8 * straight + 30 and not forced_walk and \
+                            self.world is not None and \
+                            self.world.max_top_along(x, y, goal[0], goal[1]) < me["pos"][2] + 50:
+                        path = []  # the walk goes far around: go straight over the (climbable) rooftops instead
+                self.path = path
+                self.path_goal = list(self.search_goal or goal)
+                self.path_t = t
+        if not self.path or self.path_goal is None or \
+                math.hypot(goal[0] - self.path_goal[0], goal[1] - self.path_goal[1]) > 6:
+            # no walkable route (e.g. inside the stadium bowl): head straight there and jet over walls
+            self.climbing = self.path == [] and not nav.searching()
+            return direct
+        path = self.path
+        while len(path) > 1 and math.hypot(path[0][0] - x, path[0][1] - y) < 5:
+            path.pop(0)
+        tgt = path[0]
+        for wp in path[1:6]:
+            if nav.line_free(x, y, wp[0], wp[1]):
+                tgt = wp
+            else:
+                break
+        if not nav.line_free(x, y, tgt[0], tgt[1]) and math.hypot(tgt[0] - x, tgt[1] - y) > 12:
+            self.path_t = -99.0  # knocked off the route: plan again next decision
+        return math.atan2(tgt[1] - y, tgt[0] - x)
+
+    def _zone_watchdog(self, me, goal, t: float) -> None:
+        """Heading for the zone but not getting closer for 4 s: switch between walking a route and
+        climbing straight over, for 8 s at a time."""
+        d = dist2d(me["pos"], goal)
+        if t - self.zprog_seen > 1.0:  # (re)entering zone mode: start fresh
+            self.zprog_best, self.zprog_t = d, t
+        self.zprog_seen = t
+        if d < self.zprog_best - 2:
+            self.zprog_best, self.zprog_t = d, t
+        elif t - self.zprog_t > 4 and d > 10:
+            self.force = "path" if self.force == "climb" else "climb"
+            self.force_until = t + 8
+            self.zprog_best, self.zprog_t = d, t
+            self.path_t = -99.0  # plan again under the new strategy
+
+    def _track_goal(self, key, d: float, t: float) -> None:
+        """Give up on a loot goal we have not got 3 m closer to in 7 s (unreachable, e.g. on a roof)."""
+        if key != self.goal_key:
+            self.goal_key, self.goal_best_d, self.goal_best_t = key, d, t
+            return
+        if d < self.goal_best_d - 3:
+            self.goal_best_d, self.goal_best_t = d, t
+        elif t - self.goal_best_t > 10 and d > 4:
+            self.bad_goals[key] = t + 30
+            self.goal_key = None
 
     # ------------------------------------------------------------------ targets and modes
 
     def _choose_target(self, me: Dict[str, Any], enemies: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """Lowest score wins: near, hurt, in the open, and (rules edges) showing us its back
+        (rear hits do x1.5), slowed by charging a laser, or carrying a mortar when we hold a laser (cook-off +60%)."""
         best, best_s = None, 1e9
+        my_weapons = {w["kind"] for w in me["weapons"] if w}
         for e in enemies:
             d = dist2d(e["pos"], me["pos"])
             hpf = float(e.get("hp", 1)) / max(1.0, float(e.get("max_hp", 1) or 1))
             s = d + 70 * hpf
+            if float(e.get("hp", 9999)) < 200:
+                s -= 50  # finish it: a kill is a placement
             if not self._los(me, e):
                 s += 120
+            to_me = math.atan2(me["pos"][1] - e["pos"][1], me["pos"][0] - e["pos"][0])
+            if abs(wrap(e["aim"][0] - to_me)) > math.pi / 2:
+                s -= 30
+            if e.get("charging"):
+                s -= 10
+            if "laser" in my_weapons and "mortar" in (e.get("weapons") or []):
+                s -= 20
             if e["id"] == self.target_id:
                 s -= 35
             if s < best_s:
@@ -293,18 +517,50 @@ class Bot:
         self.target_id = best["id"] if best else None
         return best
 
+    def _safe_point(self, nc: List[float], nr: float) -> Tuple[List[float], bool]:
+        """A standable spot well inside the next circle: the open ground cell nearest its center.
+        If none lies inside (center in a big building), return the center and ask to climb onto the roof."""
+        key = (round(nc[0], 1), round(nc[1], 1), round(nr, 1))
+        hit = self._safe_cache.get(key)
+        if hit is not None:
+            return hit
+        res: Tuple[List[float], bool] = ([nc[0], nc[1]], False)
+        nav = self.nav
+        if nav is not None:
+            ci, cj = nav.to_cell(nc[0], nc[1])
+            r_cells = max(0, min(20, int(nr * 0.6 / nav.cell)))
+            f = nav.nearest_free(ci, cj, max_r=r_cells)
+            if f is not None:
+                cx, cy = nav.center(*f)
+                res = ([cx, cy], False)
+            else:
+                res = ([nc[0], nc[1]], nr > 3)
+        self._safe_cache[key] = res
+        return res
+
     def _zone_goal(self, obs: Dict[str, Any], me: Dict[str, Any], t: float) -> Tuple[List[float], bool]:
         zn = obs["zone"]
         nc, nr = zn["next_center"], float(zn["next_radius"])
+        goal, self.zone_roof = self._safe_point(nc, nr)
         d = dist2d(me["pos"], nc)
         margin = min(25.0, nr * 0.25)
         need = d - (nr - margin)
         if need <= 0:
-            return nc, False
+            return goal, False
+        # The boundary starts moving at shrink_start, sliding from the current circle to the next one.
+        # Find when it would pass over where we stand now, and leave in time (walking, ~30% detour).
         speed = float(me.get("stats", {}).get("walk_speed", 11.7))
-        time_left = float(zn["shrink_end"]) - t
-        urgent = need / speed + 15 > time_left
-        return nc, urgent
+        ss, se = float(zn["shrink_start"]), float(zn["shrink_end"])
+        c0, r0 = zn["center"], float(zn["radius"])
+        reach = se
+        for k in range(21):
+            f = k / 20
+            cx, cy = c0[0] + (nc[0] - c0[0]) * f, c0[1] + (nc[1] - c0[1]) * f
+            if math.hypot(me["pos"][0] - cx, me["pos"][1] - cy) > r0 + (nr - r0) * f:
+                reach = ss + (se - ss) * f
+                break
+        urgent = need * 1.3 / speed + 10 > reach - t
+        return goal, urgent
 
     def _update_retreat(self, hp_frac: float, near: List[Dict[str, Any]], target, tgt_d: float, t: float) -> None:
         many = len(near) >= 2
@@ -321,7 +577,7 @@ class Bot:
             if hp_frac > 0.85 or (calm and hp_frac > 0.6 and not many):
                 self.retreating = False
 
-    def _fight_move(self, me, target, d, los, held, enemies, t) -> Tuple[float, float, bool]:
+    def _fight_move(self, me, target, d, los, held, obs, t) -> Tuple[float, float, bool]:
         x, y = me["pos"][0], me["pos"][1]
         to_t = math.atan2(target["pos"][1] - y, target["pos"][0] - x)
         energy = me["energy"]
@@ -333,6 +589,8 @@ class Bot:
             lo, hi = 40.0, 100.0
         if not los:
             lo, hi = 0.0, min(hi, max(20.0, d - 25))  # close in to regain a line of fire
+        # (A bullet-triggered strafe reversal, _bullet_incoming, is kept for later: it bets on how opponents aim,
+        # and repeated reversals under sustained fire could leave us nearly standing still. Test it on real scores.)
         self._maybe_flip_strafe(t)
         radial = 0.0
         if d > hi:
@@ -411,39 +669,53 @@ class Bot:
         pos = me["pos"]
         z = pos[2]
         worst = self._worst_slot_value(me)
-        best, best_c, why = None, 1e9, "loot"
+        best, best_c, why, key = None, 1e9, "loot", None
+        bad = self.bad_goals
+        w = self.world
+
+        def reachable(p: List[float]) -> bool:
+            # on the ground anywhere (hills included), or on the same roof/level as us
+            return abs(p[2] - z) < 3.5 or (w is not None and abs(p[2] - w.ground(p[0], p[1])) < 1.5)
+
         for p in obs.get("pickups", []):
-            if self.bad_pickups.get(p["id"], 0) > t or abs(p["pos"][2] - z) > 3.5:
+            if self.bad_pickups.get(p["id"], 0) > t or bad.get(("p", p["id"]), 0) > t or not reachable(p["pos"]):
                 continue
             if p["kind"] in held or WEAPON_VALUE.get(p["kind"], 0) <= worst:
                 continue
             c = dist2d(p["pos"], pos) - 40 * (WEAPON_VALUE[p["kind"]] - worst)
-            if dist2d(p["pos"], pos) < 150 and c < best_c:
-                best, best_c, why = p["pos"], c, "weapon"
+            limit = 220 if ("p", p["id"]) == self.goal_key else 150  # a route may lead away at first
+            if dist2d(p["pos"], pos) < limit and c < best_c:
+                best, best_c, why, key = p["pos"], c, "weapon", ("p", p["id"])
         for c in obs.get("cubes", []):
             d = dist2d(c["pos"], pos)
-            if d < 90 and abs(c["pos"][2] - z) < 3.5 and d - 20 < best_c:
-                best, best_c, why = c["pos"], d - 20, "cube"
+            if d < 90 and reachable(c["pos"]) and d - 20 < best_c and bad.get(("c", c["id"]), 0) <= t:
+                best, best_c, why, key = c["pos"], d - 20, "cube", ("c", c["id"])
         for dr in obs.get("drops", []):
             d = dist2d(dr["pos"], pos)
             speed = float(me.get("stats", {}).get("walk_speed", 11.7))
-            if d < 220 and float(dr.get("lands_in", 0)) < d / speed + 8 and dr.get("holder") in (None, me["id"]):
+            if d < 220 and float(dr.get("lands_in", 0)) < d / speed + 8 and dr.get("holder") in (None, me["id"]) \
+                    and bad.get(("d", dr["id"]), 0) <= t:
                 c = d - 60
                 if c < best_c:
-                    best, best_c, why = dr["pos"], c, "drop"
-        # something to shoot: a crate (cube + maybe a weapon) or, early on, a drone (2 cubes)
+                    best, best_c, why, key = dr["pos"], c, "drop", ("d", dr["id"])
+        # Something to shoot: a crate (cube + maybe a weapon) or, early on, a drone (2 cubes).
+        # Healing needs 5 s without dealing damage, so only start on these at (nearly) full HP,
+        # except a drone that is already shooting at us.
         shoot = None
         sd = 1e9
-        for cr in obs.get("crates", []):
-            d = dist2d(cr["pos"], pos)
-            if d < 130 and d < sd and self._clear_to(me, [cr["pos"][0], cr["pos"][1], cr["pos"][2] + 0.8]):
-                shoot, sd = {"kind": "crate", "pos": cr["pos"], "vel": [0, 0, 0], "id": cr["id"]}, d
-        if t < 240 and hp_frac > 0.6:
+        healthy = hp_frac >= 0.95
+        npc_on_us = self.last_damage is not None and t - self.last_damage[0] < 3 and self.last_damage[3] == "npc"
+        if healthy:
+            for cr in obs.get("crates", []):
+                d = dist2d(cr["pos"], pos)
+                if d < 130 and d < sd and self._clear_to(me, [cr["pos"][0], cr["pos"][1], cr["pos"][2] + 0.8]):
+                    shoot, sd = {"kind": "crate", "pos": cr["pos"], "vel": [0, 0, 0], "id": cr["id"]}, d
+        if (healthy and t < 240) or (npc_on_us and hp_frac > 0.35):
             for n in npcs:
                 d = dist2d(n["pos"], pos)
                 if d < 120 and d < sd and self._los(me, n):
                     shoot, sd = n, d
-        return best, shoot, why
+        return best, key, shoot, why
 
     def _clear_to(self, me, point) -> bool:
         return self.world is None or self.world.clear_line(self._muzzle(me), point)
@@ -582,7 +854,10 @@ class Bot:
             full = laser["stats"].get("charge", 0.75)
             charge = laser.get("charge", 0.0)
             if primary == "laser":
-                if laser["cooldown"] <= 0.05 and charge < full - 0.02:
+                if retreating and charge > 0:
+                    # don't keep walking at half speed for a full charge: fire what we have once on target
+                    fire[laser_i] = not on_target(aim, radius * 0.8)
+                elif laser["cooldown"] <= 0.05 and charge < full - 0.02:
                     fire[laser_i] = True
                 elif charge > 0:
                     fire[laser_i] = not on_target(aim, radius * 0.7)
