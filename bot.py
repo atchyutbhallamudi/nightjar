@@ -54,6 +54,9 @@ FLAGS: Dict[str, Any] = {
     "finish": True,        # close in on a badly hurt target
     "fight_cubes": True,   # step onto nearby cubes while fighting
     "laser_walk": 250.0,   # how far to walk for a laser in hunt persona
+    "strafe_boost": 0,     # boost while strafing in a fight when energy is above this (0 = off)
+    "fight_weapon": False, # leave a fight briefly for a laser or lightning within 80 m
+    "lethal": False,       # release a partial laser charge when it already kills
 }
 
 
@@ -741,6 +744,19 @@ class Bot:
                     reach, cube = cd, pos
             if cube is not None:
                 return self._nav_yaw(me, cube, t), 1.0, energy > 50
+        if self.hunt and FLAGS["fight_weapon"] and "laser" not in held:
+            # a better weapon lying close by is worth a few seconds of the fight
+            wp, wd = None, 80.0
+            for pid, (pos, kind, _seen) in self.mem["p"].items():
+                if kind == "mortar" or kind in held or self.bad_pickups.get(pid, 0) > t:
+                    continue
+                if kind != "laser" and len(held) >= 2:
+                    continue  # both slots full: only a laser is worth the swap
+                pd = dist2d(pos, me["pos"])
+                if pd < wd and abs(pos[2] - me["pos"][2]) < 4:
+                    wp, wd = pos, pd
+            if wp is not None:
+                return self._nav_yaw(me, wp, t), 1.0, energy > 50
         radial = 0.0
         if d > hi:
             radial = 1.0
@@ -752,6 +768,12 @@ class Bot:
         boost = (radial > 0 and d > hi + 30 and energy > 55) or (radial < 0 and energy > 35)
         if finishing and d > 40 and energy > 30:
             boost = True
+        if self.hunt and FLAGS["strafe_boost"] and los:
+            # a faster sideways target is harder to lead; keep energy back for lightning and never boost a charge
+            li = held.get("laser")
+            charging = li is not None and me["weapons"][li].get("charge", 0) > 0
+            if not charging and energy > (60 if "lightning" in held else float(FLAGS["strafe_boost"])):
+                boost = True
         return math.atan2(vy, vx), 1.0, boost
 
     def _retreat_move(self, me, threats, t, zone_goal) -> Tuple[float, float, bool]:
@@ -1026,6 +1048,10 @@ class Bot:
                 if retreating and charge > 0:
                     # don't keep walking at half speed for a full charge: fire what we have once on target
                     fire[laser_i] = not on_target(aim, radius * 0.8)
+                elif FLAGS["lethal"] and self.hunt and is_mech and charge >= laser["stats"].get("min_charge", 0.15) \
+                        and charge < full - 0.02 and self._laser_now(me, laser, charge, full, obj) * 0.7 >= \
+                        float(obj.get("hp", 1e9)) and on_target(aim, radius * 0.8):
+                    fire[laser_i] = False  # what is charged already kills: let go now
                 elif laser["cooldown"] <= 0.05 and charge < full - 0.02:
                     fire[laser_i] = True
                 elif charge > 0:
@@ -1050,6 +1076,17 @@ class Bot:
                 fire[mortar_i] = True
 
         return aim, fire, reload
+
+    def _laser_now(self, me, laser, charge: float, full: float, obj) -> float:
+        """Damage a laser shot would do if released at this charge (cube bonus and mortar cook-off included)."""
+        st = laser["stats"]
+        mf = float(st.get("min_frac", 0.35))
+        dmg = float(st.get("damage", 315)) * (mf + (1 - mf) * min(1.0, charge / max(0.01, full)))
+        cc = self.cfg.get("cubes", {})
+        dmg *= 1 + float(cc.get("damage_per_cube", 0.04)) * min(float(me.get("cubes", 0)), float(cc.get("stat_cap", 10)))
+        if "mortar" in (obj.get("weapons") or []):
+            dmg *= 1 + float(st.get("cookoff", 0.6))
+        return dmg
 
     def _hold_laser(self, me, held, fire, release: bool = False) -> None:
         """No shot for the laser right now. Keep a charge in progress for when the target reappears,
