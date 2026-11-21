@@ -177,9 +177,11 @@ class NavGrid:
         }
         return True
 
-    def step(self, budget_s: float) -> Optional[List[Tuple[float, float]]]:
+    def step(self, budget_s: float, max_nodes: int = 0) -> Optional[List[Tuple[float, float]]]:
         """Continue the search for up to budget_s. Returns the path (cell centers) once found,
-        [] if there is no path, or None if it needs more time."""
+        [] if there is no path, or None if it needs more time.
+        With max_nodes, the pause point is a fixed number of expanded cells, so the same match plays out the same
+        way on any machine; budget_s then only guards against a stalled one."""
         s = self._search
         if s is None:
             return []
@@ -192,6 +194,8 @@ class NavGrid:
         count = 0
         while openh:
             count += 1
+            if max_nodes and count > max_nodes:
+                return None
             if count % 256 == 0 and time.perf_counter() > t_end:
                 return None
             _, c, k = heapq.heappop(openh)
