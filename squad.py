@@ -788,10 +788,6 @@ class Squad:
             else:
                 aim[0] = my_aim[0] + 0.35
             aim[1] = 0.0
-            # keep a laser charge in hand rather than losing it between targets
-            for i, wpn in enumerate(me["weapons"][:2]):
-                if wpn and wpn["kind"] == "laser" and float(wpn.get("charge", 0)) > 0:
-                    fire[i] = True
         aim[1] = clamp(aim[1], float(st.get("min_pitch", -0.7)), float(st.get("max_pitch", 1.3)))
         out["aim"], out["fire"] = aim, fire
         out["reload"] = bool(gun is not None and gun.get("reload", 0) <= 0 and gun.get("ammo", 0) < gun["stats"].get("mag", 12)
