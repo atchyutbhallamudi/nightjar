@@ -45,6 +45,18 @@ UPGRADE_PREF = [
 ]
 
 
+# Switches for scoring one change at a time.
+FLAGS: Dict[str, Any] = {
+    "hunt": True,          # hunt persona while every death so far was our own kill (a squad that never fights itself)
+    "lat": 0.0,            # seconds of decision delay added to aim lead
+    "bullet_dodge": False, # reverse strafe when a bullet is on course
+    "gun_gate": 230.0,     # do not fire the gun at mechs beyond this many meters
+    "finish": True,        # close in on a badly hurt target
+    "fight_cubes": True,   # step onto nearby cubes while fighting
+    "laser_walk": 250.0,   # how far to walk for a laser in hunt persona
+}
+
+
 def wrap(a: float) -> float:
     return (a + math.pi) % TAU - math.pi
 
@@ -58,7 +70,7 @@ def unit(yaw: float) -> List[float]:
 
 
 class Bot:
-    name = "royale-v2"
+    name = "nightjar-v3"
 
     def __init__(self, hello: Dict[str, Any]) -> None:
         cfg = hello["config"]
@@ -124,6 +136,17 @@ class Bot:
         self.bad_pickups: Dict[Any, float] = {}
         self.threats: Dict[Any, Tuple[float, List[float]]] = {}
         self.slow_ticks = 0
+        # persona: "hunt" until a mech dies that we did not kill, which only happens in a real free-for-all
+        self.start_alive: Optional[int] = None
+        self.kills = 0
+        self.other_dead = 0
+        self.ffa = False
+        self.hunt = False
+        self.lose_t = -99.0
+        self.stick_t = -99.0
+        self.hit_me: Dict[Any, float] = {}
+        # remembered loot: kind -> id -> (pos, weapon kind or "", time last seen)
+        self.mem: Dict[str, Dict[Any, Tuple[List[float], str, float]]] = {"p": {}, "c": {}, "k": {}, "n": {}}
         # The map and route grid never change: move them out of the garbage collector's sight so its
         # periodic full sweeps stay short (a long pause can blow the 50 ms answer budget).
         gc.collect()
@@ -155,11 +178,21 @@ class Bot:
         if obs.get("offer"):
             act["pick"] = self._pick_upgrade(obs["offer"])
 
+        # persona: a death that was not our kill, seen on 5 decisions in a row, means a real free-for-all
+        alive = int(obs.get("alive", 16))
+        if self.start_alive is None:
+            self.start_alive = alive
+        self.other_dead = self.other_dead + 1 if self.start_alive - alive - self.kills > 0 else 0
+        if self.other_dead >= 5:
+            self.ffa = True
+        self.hunt = bool(FLAGS["hunt"]) and not self.ffa
+
         enemies = [m for m in obs["mechs"] if m["kind"] == "mech" and m["id"] != me["id"]]
         npcs = [m for m in obs["mechs"] if m["kind"] == "npc"]
         for e in enemies:
             self.threats[e["id"]] = (t, e["pos"])
         self.threats = {k: v for k, v in self.threats.items() if t - v[0] < 8}
+        self._remember(obs, me, npcs, t)
 
         weapons = me["weapons"]
         held = {w["kind"]: i for i, w in enumerate(weapons) if w}
@@ -280,6 +313,11 @@ class Bot:
                 if e.get("weapon") != "zone":
                     self.last_damage = (t, e.get("bearing"), e.get("by"), e.get("weapon", ""))
                     self.last_hurt_t = t
+                    if e.get("by") is not None:
+                        self.hit_me[e.get("by")] = t
+            elif et == "kill":
+                self.kills += 1
+                self.threats.pop(e.get("target"), None)
             elif et == "take_failed":
                 self.bad_pickups[e.get("id")] = t + 6.0
         best = None
@@ -290,6 +328,29 @@ class Bot:
                     best = s
         if best is not None:
             self.last_sound = (t - float(best.get("age", 0)), float(best["bearing"]), best["kind"])
+
+    def _remember(self, obs: Dict[str, Any], me: Dict[str, Any], npcs: List[Dict[str, Any]], t: float) -> None:
+        """Keep loot we have seen after it leaves view; forget it once we look at its spot from close by and it is gone."""
+        seen_now = set()
+        for tab, items in (("p", obs.get("pickups", [])), ("c", obs.get("cubes", [])), ("k", obs.get("crates", []))):
+            for it in items:
+                self.mem[tab][it["id"]] = (it["pos"], it.get("kind", ""), t)
+                seen_now.add((tab, it["id"]))
+        for n in npcs:
+            self.mem["n"][n["id"]] = (n["pos"], "", t)
+        st = me.get("stats", {})
+        eye = [me["pos"][0], me["pos"][1], me["pos"][2] + float(st.get("eye_height", 8))]
+        w = self.world
+        for tab in ("p", "c", "k"):
+            gone = []
+            for iid, (pos, _kind, seen) in self.mem[tab].items():
+                if (tab, iid) in seen_now or t - seen < 0.35:
+                    continue
+                if dist2d(pos, me["pos"]) < 40 and (w is None or w.clear_line(eye, [pos[0], pos[1], pos[2] + 1.5])):
+                    gone.append(iid)
+            for iid in gone:
+                del self.mem[tab][iid]
+        self.mem["n"] = {k: v for k, v in self.mem["n"].items() if t - v[2] < 120}
 
     def _pick_upgrade(self, offer: Dict[str, Any]) -> int:
         choices = offer.get("choices") or []
@@ -493,6 +554,8 @@ class Bot:
     def _choose_target(self, me: Dict[str, Any], enemies: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         """Lowest score wins: near, hurt, in the open, and (rules edges) showing us its back
         (rear hits do x1.5), slowed by charging a laser, or carrying a mortar when we hold a laser (cook-off +60%)."""
+        if self.hunt:
+            return self._choose_target_hunt(me, enemies)
         best, best_s = None, 1e9
         my_weapons = {w["kind"] for w in me["weapons"] if w}
         for e in enemies:
@@ -515,6 +578,52 @@ class Bot:
             if s < best_s:
                 best, best_s = e, s
         self.target_id = best["id"] if best else None
+        return best
+
+    def _choose_target_hunt(self, me: Dict[str, Any], enemies: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """Hunt persona: fight the mechs that are coming for us (near, closing, aiming at us, or that hit us)
+        and leave idle ones alone. Stay on one target, and strongly prefer the one closest to dying."""
+        t = self.prev_t
+        zn = self.zone_obs or {}
+        late = float(zn.get("next_radius", 999)) <= 70
+        mx, my = me["pos"][0], me["pos"][1]
+        best, best_s = None, 1e9
+        hidden, hidden_d = None, 1e9
+        for e in enemies:
+            dx, dy = e["pos"][0] - mx, e["pos"][1] - my
+            d = math.hypot(dx, dy)
+            if d > 240:
+                continue
+            hp = float(e.get("hp", 1400))
+            mhp = max(1.0, float(e.get("max_hp", 1400) or 1400))
+            closing = 0.0
+            if d > 1:
+                closing = -((e["vel"][0] - me["vel"][0]) * dx + (e["vel"][1] - me["vel"][1]) * dy) / d
+            aimed = abs(wrap(e["aim"][0] - math.atan2(-dy, -dx))) < 0.22
+            hit = t - self.hit_me.get(e["id"], -99.0)
+            engage = d < 60 or hit < 6 or late or (closing > 3 and d < 180) or (hp < 0.4 * mhp and d < 160) or \
+                (aimed and d < 190) or e["id"] == self.target_id and t - self.stick_t < 2
+            if not engage:
+                continue
+            if not self._los(me, e):
+                if d < hidden_d:
+                    hidden, hidden_d = e, d
+                continue
+            s = d + 0.18 * hp
+            if hp <= 0.3 * mhp:
+                s -= 200
+            if e["id"] == self.target_id and t - self.stick_t < 2:
+                s -= 200
+            if hit < 4:
+                s -= 40
+            if closing > 3:
+                s -= 15
+            if s < best_s:
+                best, best_s = e, s
+        if best is None:
+            best = hidden  # no clear shot at any of them: close in on the nearest
+        if best is not None:
+            self.target_id, self.stick_t = best["id"], t
         return best
 
     def _safe_point(self, nc: List[float], nr: float) -> Tuple[List[float], bool]:
@@ -563,6 +672,22 @@ class Bot:
         return goal, urgent
 
     def _update_retreat(self, hp_frac: float, near: List[Dict[str, Any]], target, tgt_d: float, t: float) -> None:
+        if self.hunt:
+            # Hunt persona: points are kills, so only step back while clearly losing, and only briefly.
+            n = len(near)
+            losing = (n >= 2 and hp_frac < 0.55) or (n >= 3 and hp_frac < 0.8)
+            if target is not None:
+                tf = float(target.get("hp", 1400)) / max(1.0, float(target.get("max_hp", 1400) or 1400))
+                if hp_frac < 0.35 and tf > hp_frac + 0.1:
+                    losing = True
+                if tf < 0.25 and hp_frac > 0.2 and n <= 2:
+                    losing = False
+            if losing:
+                if not self.retreating:
+                    self.cover = None
+                self.lose_t = t
+            self.retreating = t - self.lose_t < 1.5
+            return
         many = len(near) >= 2
         # a full laser hit does ~315 (more with cubes): leave before one more hit would leave us helpless
         laser_near = any("laser" in (e.get("weapons") or []) for e in near)
@@ -589,9 +714,33 @@ class Bot:
             lo, hi = 40.0, 100.0
         if not los:
             lo, hi = 0.0, min(hi, max(20.0, d - 25))  # close in to regain a line of fire
-        # (A bullet-triggered strafe reversal, _bullet_incoming, is kept for later: it bets on how opponents aim,
-        # and repeated reversals under sustained fire could leave us nearly standing still. Test it on real scores.)
-        self._maybe_flip_strafe(t)
+        finishing = False
+        if self.hunt and FLAGS["finish"]:
+            thp = float(target.get("hp", 1400))
+            tmax = max(1.0, float(target.get("max_hp", 1400) or 1400))
+            if thp < 0.38 * tmax and me["hp"] > 0.42 * me["max_hp"] and len(self.threats) <= 2:
+                lo, hi = 10.0, 20.0  # badly hurt target: run it down before it can heal
+                finishing = True
+        if self.hunt:
+            # hold each strafe direction for a few seconds; quick reversals keep us close to standing still
+            if t >= self.strafe_until:
+                self.strafe_dir = -self.strafe_dir
+                self.strafe_until = t + self.rng.uniform(3.0, 5.0)
+            if FLAGS["bullet_dodge"] and t - self.last_flip > 0.5 and self._bullet_incoming(obs, me):
+                self.strafe_dir = -self.strafe_dir
+                self.last_flip = t
+        else:
+            self._maybe_flip_strafe(t)
+        if self.hunt and FLAGS["fight_cubes"]:
+            # a kill drops the victim's cubes plus two; each one heals and adds damage, so step onto them mid-fight
+            reach = 70.0 if me["hp"] > 0.5 * me["max_hp"] else 40.0
+            cube = None
+            for pos, _kind, _seen in self.mem["c"].values():
+                cd = dist2d(pos, me["pos"])
+                if cd < reach and abs(pos[2] - me["pos"][2]) < 4:
+                    reach, cube = cd, pos
+            if cube is not None:
+                return self._nav_yaw(me, cube, t), 1.0, energy > 50
         radial = 0.0
         if d > hi:
             radial = 1.0
@@ -601,6 +750,8 @@ class Bot:
         vx = radial * math.cos(to_t) + math.cos(side) * (0.8 if radial else 1.0)
         vy = radial * math.sin(to_t) + math.sin(side) * (0.8 if radial else 1.0)
         boost = (radial > 0 and d > hi + 30 and energy > 55) or (radial < 0 and energy > 35)
+        if finishing and d > 40 and energy > 30:
+            boost = True
         return math.atan2(vy, vx), 1.0, boost
 
     def _retreat_move(self, me, threats, t, zone_goal) -> Tuple[float, float, bool]:
@@ -677,16 +828,27 @@ class Bot:
             # on the ground anywhere (hills included), or on the same roof/level as us
             return abs(p[2] - z) < 3.5 or (w is not None and abs(p[2] - w.ground(p[0], p[1])) < 1.5)
 
-        for p in obs.get("pickups", []):
+        hunt = self.hunt
+        if hunt:  # hunt persona also walks to loot it remembers, not only what is in view right now
+            picks = [{"id": i, "kind": k, "pos": p} for i, (p, k, _s) in self.mem["p"].items()]
+            cubes = [{"id": i, "pos": p} for i, (p, _k, _s) in self.mem["c"].items()]
+        else:
+            picks, cubes = obs.get("pickups", []), obs.get("cubes", [])
+        for p in picks:
             if self.bad_pickups.get(p["id"], 0) > t or bad.get(("p", p["id"]), 0) > t or not reachable(p["pos"]):
                 continue
             if p["kind"] in held or WEAPON_VALUE.get(p["kind"], 0) <= worst:
                 continue
+            if hunt and p["kind"] == "mortar":
+                continue  # a mortar carrier takes +60% from lasers, and the shell rarely lands
             c = dist2d(p["pos"], pos) - 40 * (WEAPON_VALUE[p["kind"]] - worst)
             limit = 220 if ("p", p["id"]) == self.goal_key else 150  # a route may lead away at first
+            if hunt and p["kind"] == "laser":
+                limit = max(limit, float(FLAGS["laser_walk"]))
+                c -= 60
             if dist2d(p["pos"], pos) < limit and c < best_c:
                 best, best_c, why, key = p["pos"], c, "weapon", ("p", p["id"])
-        for c in obs.get("cubes", []):
+        for c in cubes:
             d = dist2d(c["pos"], pos)
             if d < 90 and reachable(c["pos"]) and d - 20 < best_c and bad.get(("c", c["id"]), 0) <= t:
                 best, best_c, why, key = c["pos"], d - 20, "cube", ("c", c["id"])
@@ -703,14 +865,20 @@ class Bot:
         # except a drone that is already shooting at us.
         shoot = None
         sd = 1e9
-        healthy = hp_frac >= 0.95
+        healthy = hp_frac >= (0.5 if hunt else 0.95)
         npc_on_us = self.last_damage is not None and t - self.last_damage[0] < 3 and self.last_damage[3] == "npc"
+        if hunt and best is None and healthy:
+            # nothing to pick up: walk toward a remembered crate until it is in view to shoot
+            for cid, (cp, _k, _s) in self.mem["k"].items():
+                d = dist2d(cp, pos)
+                if 30 < d < 150 and d < best_c and reachable(cp) and bad.get(("k", cid), 0) <= t:
+                    best, best_c, why, key = cp, d, "crate", ("k", cid)
         if healthy:
             for cr in obs.get("crates", []):
                 d = dist2d(cr["pos"], pos)
                 if d < 130 and d < sd and self._clear_to(me, [cr["pos"][0], cr["pos"][1], cr["pos"][2] + 0.8]):
                     shoot, sd = {"kind": "crate", "pos": cr["pos"], "vel": [0, 0, 0], "id": cr["id"]}, d
-        if (healthy and t < 240) or (npc_on_us and hp_frac > 0.35):
+        if (healthy and (t < 240 or hunt) and (hp_frac > 0.6 or not hunt)) or (npc_on_us and hp_frac > 0.35):
             for n in npcs:
                 d = dist2d(n["pos"], pos)
                 if d < 120 and d < sd and self._los(me, n):
@@ -838,7 +1006,8 @@ class Bot:
             return d3 * math.hypot(ey * math.cos(want[1]), ep) < tol
 
         # gun
-        if gun_i is not None and gun and los and d3 <= gun["stats"].get("range", 230):
+        if gun_i is not None and gun and los and d3 <= gun["stats"].get("range", 230) and \
+                (not is_mech or d3 <= float(FLAGS["gun_gate"])):
             if primary == "gun":
                 if gun.get("ammo", 1) > 0 and on_target(aim, radius * 0.9 + 0.3):
                     fire[gun_i] = True
@@ -895,8 +1064,9 @@ class Bot:
     def _direct_aim(self, muzzle, tgt, vel, center_z, speed: Optional[float], lead_s: float = 0.0) -> List[float]:
         px, py, pz = tgt[0], tgt[1], center_z
         if speed:
+            lat = float(FLAGS["lat"])
             for _ in range(3):
-                tt = math.dist(muzzle, [px, py, pz]) / speed
+                tt = math.dist(muzzle, [px, py, pz]) / speed + lat
                 px = tgt[0] + vel[0] * tt
                 py = tgt[1] + vel[1] * tt
                 pz = center_z + (vel[2] * tt if abs(vel[2]) > 0.5 else 0.0)
@@ -954,7 +1124,7 @@ class Bot:
                 continue
             if dist2d(p["pos"], pos) > self.reach - 0.3 or abs(p["pos"][2] - pos[2]) > 3.8:
                 continue
-            if p["kind"] in held:
+            if p["kind"] in held or (self.hunt and p["kind"] == "mortar"):
                 continue
             v = WEAPON_VALUE.get(p["kind"], 0)
             if v > best_v:
