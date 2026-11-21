@@ -941,7 +941,7 @@ class Bot:
             threats.append((ed, [e["pos"][0], e["pos"][1], e["pos"][2] + eh * 8.0 / 9.0], e["pos"], e["aim"][0], rate,
                             bool(e.get("charging")), weight))
         threats.sort(key=lambda q: q[0])
-        threats = threats[:5]
+        threats = threats[:3]  # each one costs a sight line per candidate
         bullets = [p for p in obs.get("projectiles", []) if p.get("kind") != "mortar"]
         hurt = t - self.last_hurt_t < 1.5
         under_fire = hurt or bool(bullets) or any(q[5] for q in threats)
@@ -963,7 +963,10 @@ class Bot:
         n_ok = 0
         side_blocked = False
         n = 24 if can_boost else 16
+        t_start = time.perf_counter()
         for k in range(-1, n):
+            if k >= 8 and time.perf_counter() - t_start > 0.020:
+                break  # safety net for an overloaded machine: decide with what has been weighed so far
             if k < 0:
                 dx = dy = spd = 0.0
             elif k < 16:
