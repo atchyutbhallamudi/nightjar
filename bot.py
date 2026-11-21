@@ -67,7 +67,9 @@ FLAGS: Dict[str, Any] = {
     "jet_scan": False,     # at the start, jet up while turning to spot weapons over the rooftops
     "wait_laser": False,   # until we hold a laser and are above 80% HP, fight only attackers and mechs within 55 m
     "plan": False,         # fight movement by 0.8 s look-ahead (range band, line of fire, exposure, bullets, smoothness)
-    "fixes": True,         # fire check uses the commanded torso; aim at the visible part; hunters judged by their own approach
+    "fix_aim": False,      # fire check uses the torso heading after turning toward the commanded aim
+    "fix_head": False,     # aim at the visible upper body when the centre is behind cover
+    "fix_hunter": False,   # judge hunters by their own approach speed, not by ours
     "hold_drop": 0.0,      # stay in a supply ring we are capturing when this many seconds or fewer remain (0 = off)
 }
 
@@ -704,7 +706,7 @@ class Bot:
             closing = 0.0
             if d > 1:
                 closing = -((e["vel"][0] - me["vel"][0]) * dx + (e["vel"][1] - me["vel"][1]) * dy) / d
-                if FLAGS["fixes"]:
+                if FLAGS["fix_hunter"]:
                     # count only the enemy's own approach: our walking toward a mech that is standing still
                     # does not make it a hunter
                     closing = -(e["vel"][0] * dx + e["vel"][1] * dy) / d
@@ -1384,7 +1386,7 @@ class Bot:
         u_clear = (not c_clear) and obj.get("kind") != "crate" and \
             self._clear_to(me, [tgt[0], tgt[1], tgt[2] + height * 0.85])
         los = c_clear or u_clear
-        if u_clear and FLAGS["fixes"]:
+        if u_clear and FLAGS["fix_head"]:
             # only the upper body shows over cover: aim at the part we can see, not at the wall in front of its middle
             center_z = tgt[2] + height * 0.85
             d3 = math.dist(muzzle, [tgt[0], tgt[1], center_z])
@@ -1438,7 +1440,7 @@ class Bot:
         torso = [my_aim[0] + turn_y, my_aim[1] + turn_p]
 
         def on_target(want: List[float], tol: float) -> bool:
-            if FLAGS["fixes"]:
+            if FLAGS["fix_aim"]:
                 ey = abs(wrap(want[0] - torso[0]))
                 ep = abs(want[1] - torso[1])
             else:
