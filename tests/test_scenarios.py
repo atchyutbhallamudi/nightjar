@@ -132,6 +132,7 @@ class Scenarios(unittest.TestCase):
     def test_laser_released_when_retreating(self):
         a, b = self.open_pair(100, blocked=False)
         bot = self.fresh_bot()
+        bot.ffa = True  # free-for-all rules: retreat early with two enemies on us
         weapons = [self.weapon("gun"), self.weapon("laser", charge=0.5)]
         o = self.obs(a, weapons, [self.enemy(b, vel=[0, 0, 0]), self.enemy([b[0] + 10, b[1], b[2]], eid=8)])
         o["self"]["hp"] = 300

@@ -58,7 +58,7 @@ def unit(yaw: float) -> List[float]:
 
 
 class Bot:
-    name = "royale-v2"
+    name = "royale-own"
 
     def __init__(self, hello: Dict[str, Any]) -> None:
         cfg = hello["config"]
@@ -86,6 +86,13 @@ class Bot:
         self.goal_best_t = 0.0
         self.bad_goals: Dict[Any, float] = {}
         self.last_flip = -99.0
+        # Practice matches pit us against a squad that never fights itself, so every death there is our kill.
+        # Points come from kills, so play aggressively until a mech dies that we did not kill (a free-for-all).
+        self.kills = 0
+        self.ffa = False
+        self.engaged: Dict[Any, float] = {}  # enemy id -> time it last showed it is coming for us
+        self.hunt = True
+        self.retreat_since = -99.0
         self.climbing = False
         self.zone_roof = False
         self.zone_obs: Optional[Dict[str, Any]] = None
@@ -161,11 +168,17 @@ class Bot:
             self.threats[e["id"]] = (t, e["pos"])
         self.threats = {k: v for k, v in self.threats.items() if t - v[0] < 8}
 
+        # 16 mechs start; any death beyond our own kills means mechs are killing each other: a real free-for-all
+        if not self.ffa and 16 - int(obs.get("alive", 16)) > self.kills:
+            self.ffa = True
+        self.hunt = not self.ffa
+
         weapons = me["weapons"]
         held = {w["kind"]: i for i, w in enumerate(weapons) if w}
 
-        # ---------------- target choice
-        target = self._choose_target(me, enemies)
+        # ---------------- target choice (practice: only mechs that are coming for us; poking idle ones wakes more)
+        candidates = self._hunters(me, enemies, t) if self.hunt else enemies
+        target = self._choose_target(me, candidates)
         tgt_d = dist2d(target["pos"], me["pos"]) if target else 1e9
         tgt_los = self._los(me, target) if target else False
 
@@ -197,6 +210,16 @@ class Bot:
         elif target is not None:
             mode = "fight"
             move_yaw, move_mag, boost = self._fight_move(me, target, tgt_d, tgt_los, held, obs, t)
+            if self.hunt and hp_frac > 0.35:
+                # a cube close by (often from the last kill) is +4% HP and damage: step onto it, still shooting
+                best_c = None
+                for c in obs.get("cubes", []):
+                    cd = dist2d(c["pos"], me["pos"])
+                    if cd < 45 and abs(c["pos"][2] - me["pos"][2]) < 3.5 and (best_c is None or cd < best_c[0]):
+                        best_c = (cd, c["pos"])
+                if best_c is not None:
+                    move_yaw = self._nav_yaw(me, best_c[1], t)
+                    move_mag, mode = 1.0, "cube"
         else:
             goal, key, loot_target, why = self._loot_goal(obs, me, held, t, zone_goal, hp_frac, npcs)
             if goal is not None:
@@ -282,6 +305,8 @@ class Bot:
                     self.last_hurt_t = t
             elif et == "take_failed":
                 self.bad_pickups[e.get("id")] = t + 6.0
+            elif et == "kill":
+                self.kills += 1
         best = None
         for s in obs.get("sounds", []):
             if s.get("kind") in ("gun", "laser", "laser_charge", "lightning", "mortar", "step", "boost", "jet") \
@@ -331,7 +356,8 @@ class Bot:
     def _maybe_flip_strafe(self, t: float) -> None:
         if t >= self.strafe_until:
             self.strafe_dir = -self.strafe_dir if self.rng.random() < 0.7 else self.strafe_dir
-            self.strafe_until = t + self.rng.uniform(0.6, 1.8)
+            # practice: hold a direction longer (steady sideways movement, less time spent reversing)
+            self.strafe_until = t + (self.rng.uniform(1.6, 3.4) if self.hunt else self.rng.uniform(0.6, 1.8))
 
     def _bullet_incoming(self, obs, me) -> bool:
         """An enemy bullet whose straight path passes within ~4 m of us, arriving in 0.15-1 s.
@@ -490,6 +516,23 @@ class Bot:
 
     # ------------------------------------------------------------------ targets and modes
 
+    def _hunters(self, me: Dict[str, Any], enemies: List[Dict[str, Any]], t: float) -> List[Dict[str, Any]]:
+        """Enemies that are coming for us: close, recently hit us, walking toward us, or pointing their torso at us.
+        Once an enemy qualifies it stays a target for 10 s."""
+        hit_by = self.last_damage[2] if self.last_damage and t - self.last_damage[0] < 10 else None
+        out = []
+        for e in enemies:
+            d = dist2d(e["pos"], me["pos"])
+            bx, by = me["pos"][0] - e["pos"][0], me["pos"][1] - e["pos"][1]
+            bn = math.hypot(bx, by) or 1.0
+            approach = (e["vel"][0] * bx + e["vel"][1] * by) / bn  # its own speed toward us, m/s
+            facing = abs(wrap(e["aim"][0] - math.atan2(by, bx))) < 0.35
+            if d < 75 or e["id"] == hit_by or (approach > 3.0 and d < 200) or (facing and d < 160):
+                self.engaged[e["id"]] = t
+            if t - self.engaged.get(e["id"], -99.0) < 10:
+                out.append(e)
+        return out
+
     def _choose_target(self, me: Dict[str, Any], enemies: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         """Lowest score wins: near, hurt, in the open, and (rules edges) showing us its back
         (rear hits do x1.5), slowed by charging a laser, or carrying a mortar when we hold a laser (cook-off +60%)."""
@@ -563,6 +606,16 @@ class Bot:
         return goal, urgent
 
     def _update_retreat(self, hp_frac: float, near: List[Dict[str, Any]], target, tgt_d: float, t: float) -> None:
+        if self.hunt:
+            # Practice: points come only from kills, and hiding lets the squad gather. Break off only when nearly
+            # dead and the target is clearly healthier, and only briefly.
+            if not self.retreating:
+                tf = (float(target.get("hp", 0)) / max(1.0, float(target.get("max_hp", 1) or 1))) if target else 0.0
+                if hp_frac < 0.22 and tf > hp_frac + 0.2:
+                    self.retreating, self.cover, self.retreat_since = True, None, t
+            elif hp_frac > 0.45 or t - self.retreat_since > 3.5:
+                self.retreating = False
+            return
         many = len(near) >= 2
         # a full laser hit does ~315 (more with cubes): leave before one more hit would leave us helpless
         laser_near = any("laser" in (e.get("weapons") or []) for e in near)
@@ -584,9 +637,9 @@ class Bot:
         if "lightning" in held and d < 70 and energy > 25:
             lo, hi = 8.0, 28.0
         elif "laser" in held:
-            lo, hi = 60.0, 140.0
+            lo, hi = (75.0, 115.0) if self.hunt else (60.0, 140.0)
         else:
-            lo, hi = 40.0, 100.0
+            lo, hi = (45.0, 80.0) if self.hunt else (40.0, 100.0)
         if not los:
             lo, hi = 0.0, min(hi, max(20.0, d - 25))  # close in to regain a line of fire
         # (A bullet-triggered strafe reversal, _bullet_incoming, is kept for later: it bets on how opponents aim,
@@ -684,6 +737,8 @@ class Bot:
                 continue
             c = dist2d(p["pos"], pos) - 40 * (WEAPON_VALUE[p["kind"]] - worst)
             limit = 220 if ("p", p["id"]) == self.goal_key else 150  # a route may lead away at first
+            if self.hunt and p["kind"] == "laser":
+                limit = 230  # practice: a laser early is worth a long walk
             if dist2d(p["pos"], pos) < limit and c < best_c:
                 best, best_c, why, key = p["pos"], c, "weapon", ("p", p["id"])
         for c in obs.get("cubes", []):
@@ -703,7 +758,7 @@ class Bot:
         # except a drone that is already shooting at us.
         shoot = None
         sd = 1e9
-        healthy = hp_frac >= 0.95
+        healthy = hp_frac >= (0.6 if self.hunt else 0.95)  # practice: cubes matter more than a full heal
         npc_on_us = self.last_damage is not None and t - self.last_damage[0] < 3 and self.last_damage[3] == "npc"
         if healthy:
             for cr in obs.get("crates", []):
@@ -895,8 +950,9 @@ class Bot:
     def _direct_aim(self, muzzle, tgt, vel, center_z, speed: Optional[float], lead_s: float = 0.0) -> List[float]:
         px, py, pz = tgt[0], tgt[1], center_z
         if speed:
+            # our answer takes effect up to one decision (0.1 s) after the observation: lead by half of that too
             for _ in range(3):
-                tt = math.dist(muzzle, [px, py, pz]) / speed
+                tt = math.dist(muzzle, [px, py, pz]) / speed + 0.05
                 px = tgt[0] + vel[0] * tt
                 py = tgt[1] + vel[1] * tt
                 pz = center_z + (vel[2] * tt if abs(vel[2]) > 0.5 else 0.0)
@@ -941,6 +997,8 @@ class Bot:
         if recent:
             p = max(recent, key=lambda v: v[0])[1]
             return math.atan2(p[1] - me["pos"][1], p[0] - me["pos"][0])
+        if self.hunt and t % 6.0 < 2.0:
+            return me["aim"][0] + 1.0  # look all the way round every 6 s (the torso turns at its full rate)
         base = move_yaw if move_yaw is not None else me["aim"][0]
         return base + 1.0 * math.sin(t * 1.1)
 

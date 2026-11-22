@@ -56,7 +56,7 @@ class Aim(unittest.TestCase):
             s = i * 0.0005
             bullet = [252 * s * math.cos(pitch) * math.cos(yaw), 252 * s * math.cos(pitch) * math.sin(yaw),
                       7 + 252 * s * math.sin(pitch)]
-            best = min(best, math.dist(bullet, [120, 12 * s, 4.5]))
+            best = min(best, math.dist(bullet, [120, 12 * (s + 0.05), 4.5]))  # shot leaves ~0.05 s after the observation
         self.assertLess(best, 0.3)
 
 
