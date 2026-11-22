@@ -637,9 +637,9 @@ class Bot:
         if "lightning" in held and d < 70 and energy > 25:
             lo, hi = 8.0, 28.0
         elif "laser" in held:
-            lo, hi = (75.0, 115.0) if self.hunt else (60.0, 140.0)
+            lo, hi = (95.0, 135.0) if self.hunt else (60.0, 140.0)  # closer than ~110 m scored worse
         else:
-            lo, hi = (45.0, 80.0) if self.hunt else (40.0, 100.0)
+            lo, hi = (60.0, 95.0) if self.hunt else (40.0, 100.0)
         if not los:
             lo, hi = 0.0, min(hi, max(20.0, d - 25))  # close in to regain a line of fire
         # (A bullet-triggered strafe reversal, _bullet_incoming, is kept for later: it bets on how opponents aim,
