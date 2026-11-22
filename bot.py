@@ -177,7 +177,8 @@ class Bot:
         held = {w["kind"]: i for i, w in enumerate(weapons) if w}
 
         # ---------------- target choice (practice: only mechs that are coming for us; poking idle ones wakes more)
-        candidates = self._hunters(me, enemies, t) if self.hunt else enemies
+        self._hunters(me, enemies, t)  # still tracked, but every visible enemy is a candidate
+        candidates = enemies
         target = self._choose_target(me, candidates)
         tgt_d = dist2d(target["pos"], me["pos"]) if target else 1e9
         tgt_los = self._los(me, target) if target else False
