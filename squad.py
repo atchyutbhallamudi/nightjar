@@ -66,6 +66,7 @@ class Squad:
         self.loot_radius, self.laser_seek = 150.0, 240.0
         self.laser_take = 0.45      # fraction of a full charge at which the laser takes the aim from the gun
         self.spin = 0.0             # when idle, turn a full circle for 2 s of every this-many seconds (0 = off)
+        self.strafe_boost = 0.0     # in a fight, boost between spots while energy is above this (0 = off)
 
     # ------------------------------------------------------------------ small helpers
 
@@ -573,6 +574,8 @@ class Squad:
             yaw, mag = self._fight_move(obs, me, tg, seen, want, now, override)
             if light is not None and d > 50 and energy > 55 and want > 0:
                 boost = True
+            if self.strafe_boost > 0 and energy > self.strafe_boost and mag > 0:
+                boost = True  # move faster between fight spots: harder to hit, energy above the reserve only
             mode = "fight"
             reach = 70.0 if hp_frac > 0.5 else 40.0
             cube = None

@@ -79,6 +79,7 @@ FLAGS: Dict[str, Any] = {
     "squad": True,         # hunt persona decided by squad.py (whole loop: engage, position, fire, loot)
     "sq_laser_take": 0.0,  # hunt core: fraction of a full laser charge at which the laser takes the aim from the gun
     "sq_spin": 6.0,        # hunt core: idle full-circle look for 2 s of every this-many seconds (0 = off)
+    "sq_strafe_boost": 45.0,  # hunt core: boost between fight spots while energy is above this (0 = off)
 }
 
 
@@ -164,6 +165,7 @@ class Bot:
         if self.squad is not None:
             self.squad.laser_take = float(FLAGS["sq_laser_take"])
             self.squad.spin = float(FLAGS.get("sq_spin", 0.0))
+            self.squad.strafe_boost = float(FLAGS.get("sq_strafe_boost", 0.0))
         self.squad_errors = 0
         self.slow_ticks = 0
         # persona: "hunt" until a mech dies that we did not kill, which only happens in a real free-for-all
