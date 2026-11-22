@@ -65,6 +65,7 @@ class Squad:
         self.range_gun, self.range_laser, self.range_light = 85.0, 120.0, 28.0
         self.loot_radius, self.laser_seek = 150.0, 240.0
         self.laser_take = 0.45      # fraction of a full charge at which the laser takes the aim from the gun
+        self.spin = 0.0             # when idle, turn a full circle for 2 s of every this-many seconds (0 = off)
 
     # ------------------------------------------------------------------ small helpers
 
@@ -784,6 +785,8 @@ class Squad:
                 aim[0] = self.npc_bearing
             elif now - self.last_hurt < 2.5:
                 aim[0] = self.hurt_bearing
+            elif self.spin > 0 and now % self.spin < 2.0:
+                aim[0] = my_aim[0] + 1.2  # look all the way round: torso turns at its full rate
             elif out["move_yaw"] is not None:
                 aim[0] = out["move_yaw"] + 1.15 * math.sin(now * 1.3)
             else:
