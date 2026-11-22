@@ -759,14 +759,14 @@ class Bot:
         # except a drone that is already shooting at us.
         shoot = None
         sd = 1e9
-        healthy = hp_frac >= (0.6 if self.hunt else 0.95)  # practice: cubes matter more than a full heal
+        healthy = hp_frac >= (0.5 if self.hunt else 0.95)  # practice: cubes matter more than a full heal
         npc_on_us = self.last_damage is not None and t - self.last_damage[0] < 3 and self.last_damage[3] == "npc"
         if healthy:
             for cr in obs.get("crates", []):
                 d = dist2d(cr["pos"], pos)
                 if d < 130 and d < sd and self._clear_to(me, [cr["pos"][0], cr["pos"][1], cr["pos"][2] + 0.8]):
                     shoot, sd = {"kind": "crate", "pos": cr["pos"], "vel": [0, 0, 0], "id": cr["id"]}, d
-        if (healthy and t < 240) or (npc_on_us and hp_frac > 0.35):
+        if (healthy and (t < 240 or self.hunt)) or (npc_on_us and hp_frac > 0.35):
             for n in npcs:
                 d = dist2d(n["pos"], pos)
                 if d < 120 and d < sd and self._los(me, n):
