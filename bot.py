@@ -895,11 +895,11 @@ class Bot:
         # gun
         if gun_i is not None and gun and los and d3 <= gun["stats"].get("range", 230):
             if primary == "gun":
-                if gun.get("ammo", 1) > 0 and on_target(aim, radius * 0.9 + 0.3):
+                if gun.get("ammo", 1) > 0 and on_target(aim, radius * 1.2 + 0.8):
                     fire[gun_i] = True
             else:
                 gaim = self._direct_aim(muzzle, tgt, vel, center_z, gun["stats"]["speed"])
-                if gun.get("ammo", 1) > 0 and on_target(gaim, radius * 0.8):
+                if gun.get("ammo", 1) > 0 and on_target(gaim, radius * 1.3 + 0.5):
                     fire[gun_i] = True
         if gun and gun.get("ammo", 1) == 0 and not gun.get("reload"):
             reload = True
