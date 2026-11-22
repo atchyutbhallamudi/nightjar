@@ -611,7 +611,7 @@ class Bot:
             # dead and the target is clearly healthier, and only briefly.
             if not self.retreating:
                 tf = (float(target.get("hp", 0)) / max(1.0, float(target.get("max_hp", 1) or 1))) if target else 0.0
-                if hp_frac < 0.22 and tf > hp_frac + 0.2:
+                if False and hp_frac < 0.22 and tf > hp_frac + 0.2:  # variant: never break off in practice
                     self.retreating, self.cover, self.retreat_since = True, None, t
             elif hp_frac > 0.45 or t - self.retreat_since > 3.5:
                 self.retreating = False
