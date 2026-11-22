@@ -239,7 +239,7 @@ class Bot:
                 goal = self._wander_goal(obs, me, t, zone_goal)
                 move_yaw = self._nav_yaw(me, goal, t)
                 # walking slowly is silent (protocol.md section 8)
-                move_mag = 0.4 if dist2d(goal, me["pos"]) < 120 else 1.0
+                move_mag = 1.0 if self.hunt or dist2d(goal, me["pos"]) >= 120 else 0.4  # practice: no point sneaking
                 if self.zone_roof and me["in_zone"]:
                     move_mag = 0.0  # made it onto the safe roof: stay put rather than walk off the edge
 
